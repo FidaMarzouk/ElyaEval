@@ -1,6 +1,7 @@
 from .dataset import load_standard_dataset
+from .fixtures import make_golden_context_fixture
 
-__all__ = ["load_standard_dataset"]
+__all__ = ["load_standard_dataset", "make_golden_context_fixture"]
 
 # Note: metric presets (RAG_METRICS, etc.) are deliberately NOT re-exported
 # here. Constructing a DeepEval metric object initializes the judge model
