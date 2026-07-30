@@ -31,11 +31,13 @@ from typing import Any, Callable, Optional
 import pytest
 from deepeval.dataset import Golden
 
-
+#factory function: you feed it your goldens and your app's specific insert/delete logic,
+#  and it hands you back a ready-made pytest fixture shaped for your app
 def make_golden_context_fixture(
     goldens: list[Golden],
     ingest_fn: Callable[[str], Any],
     teardown_fn: Optional[Callable[[list[Any]], None]] = None,
+    #how long the fixture lives for (default: once per test session)
     scope: str = "session",
 ):
     """
@@ -59,6 +61,7 @@ def make_golden_context_fixture(
     garbage. The metric preset tells you what's being SCORED; it says
     nothing about whether the app's own retrieval step needs seeding.
     """
+    #set automatically drops duplicates
     seen: set[str] = set()
     for golden in goldens:
         for passage in golden.context or []:

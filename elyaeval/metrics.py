@@ -45,6 +45,14 @@ RETRIEVAL_METRICS = [
     ContextualRelevancyMetric(threshold=0.7),
 ]
 
+# --- generation-only --------------------------------------------------
+# Component-level: scores the generator in isolation, given whatever
+# retrieval_context it was actually handed.
+GENERATION_METRICS = [
+    AnswerRelevancyMetric(threshold=0.7),
+    FaithfulnessMetric(threshold=0.7),
+]
+
 # --- summarization --------------------------------------------------------
 SUMMARIZATION_METRICS = [
     SummarizationMetric(threshold=0.7),
