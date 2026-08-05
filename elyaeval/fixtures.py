@@ -1,11 +1,16 @@
 """
-Generic golden-context ingestion fixture.
+Most of the time you should skip this module entirely: point your test's
+GOLDENS at a goldens file written against what your app's corpus already
+contains, call your app normally, and let it retrieve for real.
 
-Retrieval-dependent metrics (ContextualPrecision/Recall/Relevancy,
-Faithfulness) can only score meaningfully if the app under test has
-something relevant to retrieve. The standard dataset ships each golden's
-ground-truth `context` passages precisely so any app can seed itself with
-them before running — see load_standard_dataset()'s module docstring.
+This fixture exists for one specific situation: you want to run the
+*shared* standard dataset (elyaeval/standard_dataset/goldens.jsonl) — a
+generic, cross-app benchmark — against YOUR app. In that situation, and only then, retrieval-dependent
+metrics (ContextualPrecision/Recall/Relevancy, Faithfulness) need
+something to find, so this fixture temporarily inserts each golden's
+ground-truth `context` passages before the suite runs and removes them
+after. Generate that variant explicitly with
+`elyaeval init --task-type <type> --corpus-mode seeded`.
 
 This module owns everything that is the SAME for every consuming app:
 looping goldens, deduping context passages, and the pytest fixture
@@ -20,11 +25,6 @@ Chroma document id, a vector index position, a dict key, anything your
 backend can address. teardown_fn(handles) receives the exact list of
 handles that were returned and removes exactly those, nothing else.
 
-This deliberately does NOT assume your storage has a queryable metadata
-field (e.g. a "source" column) to tag and filter on — some backends
-don't offer one in a comparable shape. Identifier-based delete is a
-weaker, more general assumption: almost any store can address and
-remove what it was just asked to insert.
 """
 from typing import Any, Callable, Optional
 
@@ -50,16 +50,12 @@ def make_golden_context_fixture(
 
     ingest_fn / teardown_fn are the only app-specific pieces you write.
 
-    Skip this fixture only if the app under test does NOT retrieve from a
-    corpus to produce actual_output (e.g. a stateless single-shot LLM call
-    with no external knowledge base). For any RAG app, this fixture matters
-    regardless of which metrics you're scoring with: a domain mismatch
-    between the goldens and the app's corpus produces a garbage
-    actual_output at generation time, and every metric that reads
-    actual_output — including ones that never touch retrieval_context, like
-    AnswerRelevancy or a summarization/correctness GEval — inherits that
-    garbage. The metric preset tells you what's being SCORED; it says
-    nothing about whether the app's own retrieval step needs seeding.
+    Use this only when `goldens` is (or includes) the shared standard
+    dataset and your app's corpus doesn't already contain matching
+    content — see this module's docstring. If you've written your own
+    goldens against your app's real, already-ingested corpus, don't wire
+    this fixture in at all; just call your app and let it retrieve
+    normally.
     """
     #set automatically drops duplicates
     seen: set[str] = set()

@@ -1,0 +1,70 @@
+apiVersion: tekton.dev/v1
+kind: Pipeline
+metadata:
+  name: elyaeval-rag-recipe
+spec:
+  params:
+    - name: repo-url
+      type: string
+      description: Repo containing the generated elyaeval test suite
+    - name: revision
+      type: string
+      default: main
+    - name: sut-url
+      type: string
+      description: Base URL of the SUT's /query endpoint, reachable from inside the cluster
+  workspaces:
+    - name: source
+  tasks:
+    - name: fetch-source
+      taskRef:
+        name: fetch-source
+      params:
+        - name: repo-url
+          value: $(params.repo-url)
+        - name: revision
+          value: $(params.revision)
+      workspaces:
+        - name: source
+          workspace: source
+
+    - name: setup-env
+      runAfter: [fetch-source]
+      taskRef:
+        name: setup-env
+      workspaces:
+        - name: source
+          workspace: source
+
+    - name: run-suite
+      runAfter: [setup-env]
+      taskRef:
+        name: run-suite
+      params:
+        - name: sut-url
+          value: $(params.sut-url)
+      workspaces:
+        - name: source
+          workspace: source
+
+  finally:
+    # finally tasks always run after the tasks above, regardless of
+    # whether run-suite's own steps hit a non-zero exit — that's why
+    # run-pytest above swallows pytest's exit code with `|| true`: the
+    # actual pass/fail gate is check-results, not run-suite. A failing
+    # finally task still fails the overall PipelineRun, so the gate is
+    # preserved; publish-results runs either way so you can always read
+    # the report.
+    - name: check-results
+      taskRef:
+        name: check-results
+      workspaces:
+        - name: source
+          workspace: source
+
+    - name: publish-results
+      taskRef:
+        name: publish-results
+      workspaces:
+        - name: source
+          workspace: source

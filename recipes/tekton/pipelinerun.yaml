@@ -1,0 +1,39 @@
+# Manually create one of these to trigger a run — no Triggers/EventListener
+# involved, per the "manual for now" decision.
+#
+# rag-demo is running HOST-SIDE for now (docker-compose + `uvicorn app:app
+# --host 0.0.0.0 --port 8000`), not deployed into the kind cluster — so
+# sut-url below is templated as ${SUT_URL} and resolved at apply-time via
+# the kind bridge network's gateway IP, NOT via a Service DNS name.
+#
+#   export SUT_URL="http://$(docker network inspect kind -f '{{(index .IPAM.Config 0).Gateway}}'):8000"
+#   envsubst < pipelinerun.yaml | kubectl create -f -
+#   tkn pipelinerun logs -f --last  
+#
+# (envsubst ships with gettext — `apt install gettext` / `brew install gettext`
+# if you don't have it. Confirm the gateway IP once with
+# `docker network inspect kind -f '{{(index .IPAM.Config 0).Gateway}}'`
+# before trusting it in a script — it's stable per-cluster but not a fixed
+# constant across machines/Docker versions.)
+apiVersion: tekton.dev/v1
+kind: PipelineRun
+metadata:
+  generateName: elyaeval-rag-recipe-run-
+spec:
+  pipelineRef:
+    name: elyaeval-rag-recipe
+  params:
+    - name: repo-url
+      value: https://github.com/FidaMarzouk/RagDemo.git
+    - name: revision
+      value: dev
+    - name: sut-url
+      value: ${SUT_URL}
+  workspaces:
+    - name: source
+      volumeClaimTemplate:
+        spec:
+          accessModes: ["ReadWriteOnce"]
+          resources:
+            requests:
+              storage: 1Gi

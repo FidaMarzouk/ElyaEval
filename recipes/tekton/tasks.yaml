@@ -1,0 +1,142 @@
+---
+# fetch-source: clone the repo containing the generated elyaeval test suite.
+# Nothing app-specific here — this is identical for any SUT using the recipe.
+apiVersion: tekton.dev/v1
+kind: Task
+metadata:
+  name: fetch-source
+spec:
+  params:
+    - name: repo-url
+      type: string
+    - name: revision
+      type: string
+      default: main
+  workspaces:
+    - name: source
+  steps:
+    - name: clone
+      image: alpine/git:2.45.2
+      script: |
+        #!/bin/sh
+        set -eu
+        git clone --branch "$(params.revision)" --depth 1 \
+          "$(params.repo-url)" "$(workspaces.source.path)/repo"
+
+---
+# setup-env: install exactly what the elyaeval template needs to run.
+# Deliberately NOT installing anything from the SUT's own requirements.txt
+# (no psycopg2, no llama_index, no groq client, ...) — the test process
+# only ever talks to RAG_APP_URL over HTTP, so it doesn't need the SUT's
+# dependencies at all. This is the concrete proof that the recipe is
+# decoupled: if this step ever needs a SUT-specific package to succeed,
+# something upstream (run_app) has re-coupled it.
+apiVersion: tekton.dev/v1
+kind: Task
+metadata:
+  name: setup-env
+spec:
+  workspaces:
+    - name: source
+  steps:
+    - name: install-deps
+      image: python:3.11-slim
+      workingDir: $(workspaces.source.path)/repo
+      script: |
+        #!/bin/sh
+        set -eu
+
+        pip install --no-cache-dir \
+          git+https://github.com/FidaMarzouk/ElyaEval.git@v0.1.0 \
+          pytest \
+          deepeval \
+          requests
+
+---
+# run-suite: the actual test entrypoint. sut-url is the ONLY thing this
+# Task knows about the system under test.
+apiVersion: tekton.dev/v1
+kind: Task
+metadata:
+  name: run-suite
+spec:
+  params:
+    - name: sut-url
+      type: string
+      description: Base URL of the SUT's /query endpoint, reachable from inside this cluster
+  workspaces:
+    - name: source
+  steps:
+    - name: run-pytest
+      image: python:3.11-slim
+      workingDir: $(workspaces.source.path)/repo
+      env:
+        - name: RAG_APP_URL
+          value: $(params.sut-url)
+      script: |
+        #!/bin/sh
+        set -eu
+        pip install --no-cache-dir elyaeval pytest deepeval requests
+        mkdir -p "$(workspaces.source.path)/report"
+        # `|| true` so a test-content failure (assertion) still lets us
+        # reach check-results and publish-results with the report intact —
+        # check-results is what actually fails the PipelineRun.
+        python -m pytest test_elyaeval_rag_qa.py \
+          --junitxml="$(workspaces.source.path)/report/junit.xml" \
+          -q || true
+
+---
+# check-results: gate on the JUnit output. This is a placeholder for real
+# cost-budget gating — assert_test doesn't currently expose DeepEval's
+# per-metric cost data, only pass/fail (see earlier discussion: switching
+# to evaluate() directly is the follow-up needed before this Task can
+# enforce a cost budget instead of just a pass/fail gate).
+apiVersion: tekton.dev/v1
+kind: Task
+metadata:
+  name: check-results
+spec:
+  workspaces:
+    - name: source
+  steps:
+    - name: check-junit
+      image: python:3.11-slim
+      script: |
+        #!/bin/sh
+        set -eu
+        python - <<'EOF'
+        import sys
+        import xml.etree.ElementTree as ET
+
+        path = "$(workspaces.source.path)/report/junit.xml"
+        root = ET.parse(path).getroot()
+        suite = root if root.tag == "testsuite" else root.find("testsuite")
+        failures = int(suite.get("failures", 0))
+        errors = int(suite.get("errors", 0))
+        total = int(suite.get("tests", 0))
+        print(f"{total} tests, {failures} failures, {errors} errors")
+        if failures or errors:
+            sys.exit(1)
+        EOF
+
+---
+# publish-results: for a kind-cluster recipe, "publish" means "make it
+# readable without extra infra" — print the report to the Task's logs
+# (visible via `tkn taskrun logs` / `kubectl logs`) so it survives the
+# pod being gone. Swap this step for an upload-to-object-storage call
+# once you have somewhere durable to put it.
+apiVersion: tekton.dev/v1
+kind: Task
+metadata:
+  name: publish-results
+spec:
+  workspaces:
+    - name: source
+  steps:
+    - name: print-report
+      image: python:3.11-slim
+      script: |
+        #!/bin/sh
+        set -eu
+        echo "----- junit.xml -----"
+        cat "$(workspaces.source.path)/report/junit.xml"

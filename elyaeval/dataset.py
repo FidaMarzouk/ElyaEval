@@ -2,15 +2,11 @@
 Loads the standard dataset (goldens.jsonl, versioned and shipped inside this
 package and returns deepeval Golden objects, filtered by task_type and/or ci_stage.
 
-IMPORTANT — retrieval_context is intentionally dropped here, even if a row
-in goldens.jsonl happens to contain one. The standard dataset is shared
-across every user's app; retrieval_context is what a specific app's
-retriever actually returned for a given input, which differs per app and
-can only be known by calling that app. It is filled in by the generated
-test file (see templates/test_template.py.tmpl), never by this loader.
-`context` (the ideal/ground-truth passages) is the one retrieval-shaped
-field that *is* safe to ship pre-filled, since it does not depend on any
-particular app's retriever.
+Pass your own `dataset_path` to evaluate against a goldens file written
+for YOUR app's real corpus instead of the bundled generic one — this is
+the recommended input for the default `elyaeval init` template.
+Same JSONL shape as the standard dataset; `context` is optional per row (omit it, or leave it null, 
+for goldens you don't have an ideal-passage judgment for — only the Contextual* metrics need it).
 """
 
 import json
