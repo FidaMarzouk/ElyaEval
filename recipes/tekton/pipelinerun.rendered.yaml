@@ -15,11 +15,11 @@ spec:
       - name: revision
         value: dev
       - name: sut-url
-        value: ${SUT_URL}
+        value: http://host.docker.internal:8000
       - name: judge-model-name
-        value: ${JUDGE_MODEL_NAME}
+        value: llama3.1
       - name: judge-base-url
-        value: ${JUDGE_BASE_URL}
+        value: http://host.docker.internal:11434/v1
   workspaces:
     - name: source
       volumeClaimTemplate:

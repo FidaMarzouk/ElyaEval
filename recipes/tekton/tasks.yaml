@@ -24,13 +24,17 @@ spec:
           "$(params.repo-url)" "$(workspaces.source.path)/repo"
 
 ---
-# setup-env: install exactly what the elyaeval template needs to run.
-# Deliberately NOT installing anything from the SUT's own requirements.txt
-# (no psycopg2, no llama_index, no groq client, ...) — the test process
-# only ever talks to RAG_APP_URL over HTTP, so it doesn't need the SUT's
-# dependencies at all. This is the concrete proof that the recipe is
-# decoupled: if this step ever needs a SUT-specific package to succeed,
-# something upstream (run_app) has re-coupled it.
+# setup-env: install exactly what the elyaeval template needs to run,
+# caching everything in the workspace so run-suite can reuse it without
+# reinstalling. Deliberately NOT installing anything from the SUT's own
+# requirements.txt (no psycopg2, no llama_index, no groq client, ...) —
+# the test process only ever talks to RAG_APP_URL over HTTP, so it doesn't
+# need the SUT's dependencies at all.
+#
+# pip install --target puts all packages in workspace/.python-packages,
+# persisted across tasks via the shared workspace volume. run-suite sets
+# PYTHONPATH to reuse these cached packages without network calls or
+# reimplementation.
 apiVersion: tekton.dev/v1
 kind: Task
 metadata:
@@ -41,20 +45,39 @@ spec:
   steps:
     - name: install-deps
       image: python:3.11-slim
-      workingDir: $(workspaces.source.path)/repo
+      workingDir: $(workspaces.source.path)
       script: |
         #!/bin/sh
         set -eu
-
+        
+        # Install system packages needed for pip (git for git+https:// URLs)
+        apt-get update && apt-get install -y git
+        
+        # Install Python deps to workspace/.python-packages
+        # --target installs to a directory that becomes part of PYTHONPATH in run-suite
+        mkdir -p "$(workspaces.source.path)/.python-packages"
         pip install --no-cache-dir \
-          git+https://github.com/FidaMarzouk/ElyaEval.git@v0.1.0 \
+          --target "$(workspaces.source.path)/.python-packages" \
+          git+https://github.com/FidaMarzouk/ElyaEval.git@v0.1.2 \
           pytest \
           deepeval \
           requests
+        
+        echo "✓ Dependencies installed to .python-packages"
 
 ---
-# run-suite: the actual test entrypoint. sut-url is the ONLY thing this
-# Task knows about the system under test.
+# run-suite: the actual test entrypoint.
+#
+# judge-model-name / judge-base-url / judge-api-key configure the DeepEval
+# judge model that RAG_METRICS uses when assert_test() runs inside this
+# same step. These are left as params (not hardcoded) because the judge
+# model is a per-user/per-environment choice, a different local model
+# server entirely, or a hosted OpenAI-compatible endpoint. USE_LOCAL_MODEL,
+# LOCAL_MODEL_NAME, LOCAL_MODEL_BASE_URL, and LOCAL_MODEL_API_KEY are read
+# directly by DeepEval's pydantic Settings from the environment — no need
+# for the `deepeval set-local-model` CLI (whose console-script entry point
+# wouldn't exist anyway, since setup-env installs via `pip install --target`,
+# which doesn't create entry-point scripts).
 apiVersion: tekton.dev/v1
 kind: Task
 metadata:
@@ -64,6 +87,16 @@ spec:
     - name: sut-url
       type: string
       description: Base URL of the SUT's /query endpoint, reachable from inside this cluster
+    - name: judge-model-name
+      type: string
+      description: Name of the local judge model (e.g. llama3.1, qwen2.5:14b)
+    - name: judge-base-url
+      type: string
+      description: OpenAI-compatible base URL for the judge model, reachable from inside this cluster
+    - name: judge-api-key
+      type: string
+      default: "ollama"
+      description: API key for the judge endpoint (Ollama ignores the value but requires one)
   workspaces:
     - name: source
   steps:
@@ -73,13 +106,24 @@ spec:
       env:
         - name: RAG_APP_URL
           value: $(params.sut-url)
+        - name: PYTHONPATH
+          value: $(workspaces.source.path)/.python-packages
+        - name: USE_LOCAL_MODEL
+          value: "1"
+        - name: LOCAL_MODEL_NAME
+          value: $(params.judge-model-name)
+        - name: LOCAL_MODEL_BASE_URL
+          value: $(params.judge-base-url)
+        - name: LOCAL_MODEL_API_KEY
+          value: $(params.judge-api-key)
       script: |
         #!/bin/sh
         set -eu
-        pip install --no-cache-dir elyaeval pytest deepeval requests
+        
         mkdir -p "$(workspaces.source.path)/report"
-        # `|| true` so a test-content failure (assertion) still lets us
-        # reach check-results and publish-results with the report intact —
+        
+        # || true so a test-content failure (assertion) still lets us reach
+        # check-results and publish-results with the report intact —
         # check-results is what actually fails the PipelineRun.
         python -m pytest test_elyaeval_rag_qa.py \
           --junitxml="$(workspaces.source.path)/report/junit.xml" \
@@ -120,8 +164,7 @@ spec:
         EOF
 
 ---
-# publish-results: for a kind-cluster recipe, "publish" means "make it
-# readable without extra infra" — print the report to the Task's logs
+# publish-results: for a kind-cluster recipe, print the report to the Task's logs
 # (visible via `tkn taskrun logs` / `kubectl logs`) so it survives the
 # pod being gone. Swap this step for an upload-to-object-storage call
 # once you have somewhere durable to put it.

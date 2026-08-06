@@ -4,15 +4,25 @@ metadata:
   name: elyaeval-rag-recipe
 spec:
   params:
-    - name: repo-url
-      type: string
-      description: Repo containing the generated elyaeval test suite
-    - name: revision
-      type: string
-      default: main
-    - name: sut-url
-      type: string
-      description: Base URL of the SUT's /query endpoint, reachable from inside the cluster
+      - name: repo-url
+        type: string
+        description: Repo containing the generated elyaeval test suite
+      - name: revision
+        type: string
+        default: main
+      - name: sut-url
+        type: string
+        description: Base URL of the SUT's /query endpoint, reachable from inside the cluster
+      - name: judge-model-name
+        type: string
+        description: Name of the local judge model (e.g. llama3.1, qwen2.5:14b)
+      - name: judge-base-url
+        type: string
+        description: OpenAI-compatible base URL for the judge model, reachable from inside the cluster
+      - name: judge-api-key
+        type: string
+        default: "ollama"
+        description: API key for the judge endpoint (Ollama ignores the value but requires one)
   workspaces:
     - name: source
   tasks:
@@ -43,6 +53,12 @@ spec:
       params:
         - name: sut-url
           value: $(params.sut-url)
+        - name: judge-model-name
+          value: $(params.judge-model-name)
+        - name: judge-base-url
+          value: $(params.judge-base-url)
+        - name: judge-api-key
+          value: $(params.judge-api-key)
       workspaces:
         - name: source
           workspace: source
