@@ -106,6 +106,8 @@ spec:
       env:
         - name: RAG_APP_URL
           value: $(params.sut-url)
+        - name: REPORT_CSV
+          value: $(workspaces.source.path)/report/results_rag_qa.csv
         - name: PYTHONPATH
           value: $(workspaces.source.path)/.python-packages
         - name: USE_LOCAL_MODEL
