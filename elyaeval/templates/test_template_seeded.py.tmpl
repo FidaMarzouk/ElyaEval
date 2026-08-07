@@ -24,14 +24,22 @@ WHAT YOU NEED TO FILL IN (search for TODO):
   2. Implement run_app() to call it and return (actual_output, retrieval_context).
   3. Implement _ingest_passage / _teardown_passages for YOUR storage backend
      (see elyaeval.fixtures.make_golden_context_fixture for the contract).
+
+REPORT_CSV: each golden's per-metric scores (name/score/threshold/success/
+reason) are appended to this CSV as they run — one row per metric. Point it
+at wherever your CI workspace collects reports; defaults to a local
+report/ dir for running the suite by hand.
 """
 
-from deepeval import assert_test
+from pathlib import Path
+
 from deepeval.test_case import LLMTestCase
 import pytest
 
-from elyaeval import load_standard_dataset, make_golden_context_fixture
+from elyaeval import load_standard_dataset, make_golden_context_fixture, evaluate_golden
 from elyaeval.metrics import {metrics_constant}
+
+REPORT_CSV = Path("report/results_{task_type}.csv")
 
 # TODO 1: import your app under test, e.g.:
 # from myapp.pipeline import answer_question
@@ -95,4 +103,8 @@ def test_{task_type}(golden):
         retrieval_context=retrieval_context,
     )
 
-    assert_test(test_case, {metrics_constant})
+    # One evaluate() call per golden (test_cases=[test_case], never the
+    # whole GOLDENS list) — keeps scoring per-golden and gives each a
+    # clean row (or rows, one per metric) in REPORT_CSV.
+    result = evaluate_golden(golden, test_case, {metrics_constant}, csv_path=REPORT_CSV)
+    assert result.success, f"{{result.name}} failed — see {{REPORT_CSV}} for per-metric scores"

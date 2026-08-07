@@ -4,25 +4,46 @@ metadata:
   name: elyaeval-rag-recipe
 spec:
   params:
-      - name: repo-url
-        type: string
-        description: Repo containing the generated elyaeval test suite
-      - name: revision
-        type: string
-        default: main
-      - name: sut-url
-        type: string
-        description: Base URL of the SUT's /query endpoint, reachable from inside the cluster
-      - name: judge-model-name
-        type: string
-        description: Name of the local judge model (e.g. llama3.1, qwen2.5:14b)
-      - name: judge-base-url
-        type: string
-        description: OpenAI-compatible base URL for the judge model, reachable from inside the cluster
-      - name: judge-api-key
-        type: string
-        default: "ollama"
-        description: API key for the judge endpoint (Ollama ignores the value but requires one)
+    - name: repo-url
+      type: string
+      description: Repo containing the generated elyaeval test suite
+    - name: revision
+      type: string
+      default: dev
+    - name: elyaeval-package-spec
+      type: string
+      default: "git+https://github.com/FidaMarzouk/ElyaEval.git@v0.1.2"
+      description: pip-installable spec for the elyaeval package
+    - name: sut-url
+      type: string
+      description: Base URL of the SUT's /query endpoint, reachable from inside the cluster
+    - name: judge-model-name
+      type: string
+      description: "Model identifier for DeepEval's judge, e.g. openai/gpt-oss-120b or llama3.1"
+    - name: judge-model-base-url
+      type: string
+      description: "OpenAI-compatible base URL for the judge model"
+    - name: judge-model-format
+      type: string
+      default: json
+    - name: judge-api-key-secret-name
+      type: string
+      default: judge-model-credentials
+    - name: judge-api-key-secret-key
+      type: string
+      default: api-key
+    - name: results-repo-url
+      type: string
+      description: HTTPS repo URL (no credentials) to commit CI results into
+    - name: results-branch
+      type: string
+      default: ci-results
+    - name: results-secret-name
+      type: string
+      default: git-write-credentials
+    - name: results-secret-key
+      type: string
+      default: token
   workspaces:
     - name: source
   tasks:
@@ -42,6 +63,9 @@ spec:
       runAfter: [fetch-source]
       taskRef:
         name: setup-env
+      params:
+        - name: elyaeval-package-spec
+          value: $(params.elyaeval-package-spec)
       workspaces:
         - name: source
           workspace: source
@@ -55,10 +79,14 @@ spec:
           value: $(params.sut-url)
         - name: judge-model-name
           value: $(params.judge-model-name)
-        - name: judge-base-url
-          value: $(params.judge-base-url)
-        - name: judge-api-key
-          value: $(params.judge-api-key)
+        - name: judge-model-base-url
+          value: $(params.judge-model-base-url)
+        - name: judge-model-format
+          value: $(params.judge-model-format)
+        - name: judge-api-key-secret-name
+          value: $(params.judge-api-key-secret-name)
+        - name: judge-api-key-secret-key
+          value: $(params.judge-api-key-secret-key)
       workspaces:
         - name: source
           workspace: source
@@ -78,9 +106,18 @@ spec:
         - name: source
           workspace: source
 
-    - name: publish-results
-      taskRef:
-        name: publish-results
-      workspaces:
-        - name: source
-          workspace: source
+#    - name: publish-results
+#      taskRef:
+#        name: publish-results
+#      params:
+#        - name: results-repo-url
+#          value: $(params.results-repo-url)
+#        - name: results-branch
+#          value: $(params.results-branch)
+#        - name: results-secret-name
+#          value: $(params.results-secret-name)
+#        - name: results-secret-key
+#          value: $(params.results-secret-key)
+#      workspaces:
+#        - name: source
+#          workspace: source

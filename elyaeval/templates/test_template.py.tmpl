@@ -8,8 +8,7 @@ LLMTestCase, Golden). ElyaEval supplied the dataset and the metric preset.
 EXISTING-CORPUS mode (the default): this suite assumes your app's corpus
 already has content relevant to GOLDENS below, so it just calls run_app()
 and lets your app retrieve normally — nothing is inserted or removed from
-your storage. This is what you want whenever the goldens you're testing
-with describe things your app can actually already answer.
+your storage.
 
 The bundled standard dataset is a generic, cross-app benchmark — it is
 almost never a corpus match for YOUR app. For this mode to produce
@@ -32,14 +31,23 @@ throwaway CI corpus). That's a different, opt-in generator:
 WHAT YOU NEED TO FILL IN (search for TODO):
   1. Import your app's entrypoint function.
   2. Implement run_app() to call it and return (actual_output, retrieval_context).
+
+REPORT_CSV: each golden's per-metric scores (name/score/threshold/success/
+reason) are appended to this CSV as they run — one row per metric, so you
+can filter/sort by metric or golden afterward instead of reading raw
+pytest/junit output. Point it at wherever your CI workspace collects
+reports; it defaults to a local report/ dir for running the suite by hand.
 """
 
-from deepeval import assert_test
+from pathlib import Path
+
 from deepeval.test_case import LLMTestCase
 import pytest
 
-from elyaeval import load_standard_dataset
+from elyaeval import load_standard_dataset, evaluate_golden
 from elyaeval.metrics import {metrics_constant}
+
+REPORT_CSV = Path("report/results_{task_type}.csv")
 
 # TODO 1: import your app under test, e.g.:
 # from myapp.pipeline import answer_question
@@ -81,4 +89,8 @@ def test_{task_type}(golden):
         retrieval_context=retrieval_context,
     )
 
-    assert_test(test_case, {metrics_constant})
+    # One evaluate() call per golden (test_cases=[test_case], never the
+    # whole GOLDENS list) — keeps scoring per-golden and gives each a
+    # clean row (or rows, one per metric) in REPORT_CSV.
+    result = evaluate_golden(golden, test_case, {metrics_constant}, csv_path=REPORT_CSV)
+    assert result.success, f"{{result.name}} failed — see {{REPORT_CSV}} for per-metric scores"

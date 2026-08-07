@@ -31,6 +31,11 @@ spec:
 # the test process only ever talks to RAG_APP_URL over HTTP, so it doesn't
 # need the SUT's dependencies at all.
 #
+# elyaeval-package-spec defaults to the framework's own current pinned
+# release — that default is legitimately framework-owned (every recipe
+# instance installs the same template code), not SUT-specific, but it's
+# still a param so a newer tag doesn't require editing this file.
+#
 # pip install --target puts all packages in workspace/.python-packages,
 # persisted across tasks via the shared workspace volume. run-suite sets
 # PYTHONPATH to reuse these cached packages without network calls or
@@ -40,6 +45,11 @@ kind: Task
 metadata:
   name: setup-env
 spec:
+  params:
+    - name: elyaeval-package-spec
+      type: string
+      default: "git+https://github.com/FidaMarzouk/ElyaEval.git@v0.1.2"
+      description: pip-installable spec for the elyaeval package (git+https://... or a plain version pin)
   workspaces:
     - name: source
   steps:
@@ -58,7 +68,7 @@ spec:
         mkdir -p "$(workspaces.source.path)/.python-packages"
         pip install --no-cache-dir \
           --target "$(workspaces.source.path)/.python-packages" \
-          git+https://github.com/FidaMarzouk/ElyaEval.git@v0.1.2 \
+          "$(params.elyaeval-package-spec)" \
           pytest \
           deepeval \
           requests
@@ -66,18 +76,11 @@ spec:
         echo "✓ Dependencies installed to .python-packages"
 
 ---
-# run-suite: the actual test entrypoint.
-#
-# judge-model-name / judge-base-url / judge-api-key configure the DeepEval
-# judge model that RAG_METRICS uses when assert_test() runs inside this
-# same step. These are left as params (not hardcoded) because the judge
-# model is a per-user/per-environment choice, a different local model
-# server entirely, or a hosted OpenAI-compatible endpoint. USE_LOCAL_MODEL,
-# LOCAL_MODEL_NAME, LOCAL_MODEL_BASE_URL, and LOCAL_MODEL_API_KEY are read
-# directly by DeepEval's pydantic Settings from the environment — no need
-# for the `deepeval set-local-model` CLI (whose console-script entry point
-# wouldn't exist anyway, since setup-env installs via `pip install --target`,
-# which doesn't create entry-point scripts).
+# run-suite: the actual test entrypoint. sut-url and the judge-model-*
+# params are the ONLY things this Task knows about a given run — nothing
+# here is specific to any one SUT's stack or any one team's judge-model
+# provider. Change judge-model-* per PipelineRun, not per Task edit.
+# No pip installs here — reuses packages cached by setup-env via PYTHONPATH.
 apiVersion: tekton.dev/v1
 kind: Task
 metadata:
@@ -89,14 +92,22 @@ spec:
       description: Base URL of the SUT's /query endpoint, reachable from inside this cluster
     - name: judge-model-name
       type: string
-      description: Name of the local judge model (e.g. llama3.1, qwen2.5:14b)
-    - name: judge-base-url
+      description: "Model identifier for DeepEval's judge, e.g. openai/gpt-oss-120b or llama3.1"
+    - name: judge-model-base-url
       type: string
-      description: OpenAI-compatible base URL for the judge model, reachable from inside this cluster
-    - name: judge-api-key
+      description: "OpenAI-compatible base URL for the judge model, e.g. https://api.groq.com/openai/v1 or http://localhost:11434/v1"
+    - name: judge-model-format
       type: string
-      default: "ollama"
-      description: API key for the judge endpoint (Ollama ignores the value but requires one)
+      default: json
+      description: LOCAL_MODEL_FORMAT value DeepEval expects for this provider
+    - name: judge-api-key-secret-name
+      type: string
+      default: judge-model-credentials
+      description: Name of the Secret holding the judge model's API key
+    - name: judge-api-key-secret-key
+      type: string
+      default: api-key
+      description: Key within that Secret holding the judge model's API key
   workspaces:
     - name: source
   steps:
@@ -106,23 +117,36 @@ spec:
       env:
         - name: RAG_APP_URL
           value: $(params.sut-url)
-        - name: REPORT_CSV
-          value: $(workspaces.source.path)/report/results_rag_qa.csv
         - name: PYTHONPATH
           value: $(workspaces.source.path)/.python-packages
-        - name: USE_LOCAL_MODEL
+        - name: DEEPEVAL_DISABLE_DOTENV
           value: "1"
+        - name: USE_LOCAL_MODEL
+          value: "True"
         - name: LOCAL_MODEL_NAME
           value: $(params.judge-model-name)
         - name: LOCAL_MODEL_BASE_URL
-          value: $(params.judge-base-url)
+          value: $(params.judge-model-base-url)
+        - name: LOCAL_MODEL_FORMAT
+          value: $(params.judge-model-format)
         - name: LOCAL_MODEL_API_KEY
-          value: $(params.judge-api-key)
+          valueFrom:
+            secretKeyRef:
+              name: $(params.judge-api-key-secret-name)
+              key: $(params.judge-api-key-secret-key)
       script: |
         #!/bin/sh
         set -eu
         
         mkdir -p "$(workspaces.source.path)/report"
+        mkdir -p "$(workspaces.source.path)/report/deepeval_results"
+        
+        # DEEPEVAL_RESULTS_FOLDER: structured JSON per run — score, reason,
+        # and cost per metric per test case. junit.xml (below) can only
+        # ever carry pass/fail; this is what actually captures the "clearer
+        # output" deepeval prints to the terminal locally. Works alongside
+        # assert_test()-based gating, no need to switch to evaluate().
+        export DEEPEVAL_RESULTS_FOLDER="$(workspaces.source.path)/report/deepeval_results"
         
         # || true so a test-content failure (assertion) still lets us reach
         # check-results and publish-results with the report intact —
@@ -132,11 +156,11 @@ spec:
           -q || true
 
 ---
-# check-results: gate on the JUnit output. This is a placeholder for real
-# cost-budget gating — assert_test doesn't currently expose DeepEval's
-# per-metric cost data, only pass/fail (see earlier discussion: switching
-# to evaluate() directly is the follow-up needed before this Task can
-# enforce a cost budget instead of just a pass/fail gate).
+# check-results: gate on the JUnit output — pass/fail only, which is all
+# this needs to enforce a hard gate. Score/reason/cost detail lives in
+# report/deepeval_results/*.json (from DEEPEVAL_RESULTS_FOLDER in
+# run-suite) — see publish-results for that side of it. A future
+# cost-budget Task would parse that JSON instead of adding logic here.
 apiVersion: tekton.dev/v1
 kind: Task
 metadata:
@@ -166,22 +190,76 @@ spec:
         EOF
 
 ---
-# publish-results: for a kind-cluster recipe, print the report to the Task's logs
-# (visible via `tkn taskrun logs` / `kubectl logs`) so it survives the
-# pod being gone. Swap this step for an upload-to-object-storage call
-# once you have somewhere durable to put it.
+# publish-results: commits the JUnit report + structured DeepEval JSON to
+# a dedicated results branch in the repo, under ci-reports/<run-name>/.
+# Self-hosted, versioned, diffable across runs — no external storage system.
+#
+# The Secret name/key are params, not fixed — a team can point this at
+# whatever Secret already holds their write token without editing the Task.
+#
+# Falls back to creating an orphan branch on first run (when
+# results-branch doesn't exist yet).
 apiVersion: tekton.dev/v1
 kind: Task
 metadata:
   name: publish-results
 spec:
+  params:
+    - name: results-repo-url
+      type: string
+      description: HTTPS repo URL (no credentials) to commit results into, e.g. https://github.com/org/repo.git
+    - name: results-branch
+      type: string
+      default: ci-results
+    - name: results-secret-name
+      type: string
+      default: git-write-credentials
+      description: Name of the Secret holding a repo-write token
+    - name: results-secret-key
+      type: string
+      default: token
+      description: Key within that Secret holding the token
   workspaces:
     - name: source
   steps:
-    - name: print-report
-      image: python:3.11-slim
+    - name: commit-report
+      image: alpine/git:2.45.2
+      env:
+        - name: GIT_TOKEN
+          valueFrom:
+            secretKeyRef:
+              name: $(params.results-secret-name)
+              key: $(params.results-secret-key)
       script: |
         #!/bin/sh
         set -eu
-        echo "----- junit.xml -----"
-        cat "$(workspaces.source.path)/report/junit.xml"
+
+        AUTH_URL=$(echo "$(params.results-repo-url)" | sed "s#https://#https://x-access-token:${GIT_TOKEN}@#")
+        WORKDIR=/tmp/results-repo
+        RUN_DIR="ci-reports/$(context.taskRun.name)"
+
+        # Clone the results branch if it exists; otherwise start an orphan branch
+        if git clone --branch "$(params.results-branch)" --depth 1 "$AUTH_URL" "$WORKDIR" 2>/dev/null; then
+          echo "Cloned existing $(params.results-branch) branch"
+        else
+          echo "$(params.results-branch) doesn't exist yet — creating it"
+          git clone --depth 1 "$AUTH_URL" "$WORKDIR"
+          cd "$WORKDIR"
+          git checkout --orphan "$(params.results-branch)"
+          git rm -rf . > /dev/null 2>&1 || true
+          cd -
+        fi
+
+        mkdir -p "$WORKDIR/$RUN_DIR"
+        cp "$(workspaces.source.path)/report/junit.xml" "$WORKDIR/$RUN_DIR/junit.xml"
+        # Structured score/reason/cost detail — the part junit.xml can't carry
+        cp -r "$(workspaces.source.path)/report/deepeval_results/." "$WORKDIR/$RUN_DIR/" 2>/dev/null || true
+
+        cd "$WORKDIR"
+        git config user.email "ci-bot@elyaeval.local"
+        git config user.name "elyaeval-ci-bot"
+        git add "$RUN_DIR"
+        git commit -m "CI results: $(context.taskRun.name)"
+        git push origin "$(params.results-branch)"
+
+        echo "Published to $(params.results-repo-url) @ $(params.results-branch)/$RUN_DIR"
