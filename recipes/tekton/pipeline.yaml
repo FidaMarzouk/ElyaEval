@@ -12,11 +12,26 @@ spec:
       default: dev
     - name: elyaeval-package-spec
       type: string
-      default: "git+https://github.com/FidaMarzouk/ElyaEval.git@v0.1.2"
-      description: pip-installable spec for the elyaeval package
+      default: "git+https://github.com/FidaMarzouk/ElyaEval.git@eval"
+      description: >-
+        pip-installable spec for the elyaeval framework itself (not the SUT).
+        This is the one deliberately hardcoded default in the whole recipe —
+        every project runs the same framework code, so it's pinned centrally
+        here and ONLY here. Override per-run if you need to test against a
+        different framework tag/branch.
     - name: sut-url
       type: string
       description: Base URL of the SUT's /query endpoint, reachable from inside the cluster
+    - name: test-file
+      type: string
+      default: test_elyaeval_rag_qa.py
+      description: >-
+        Path (relative to the repo root) of the generated elyaeval test
+        file to run — output of `elyaeval init --task-type ...` in the SUT
+        repo. Defaults to the rag_qa filename since that's the only task
+        type currently wired into this recipe; pass a different value here
+        once other task types (agentic, classifier, ...) get their own
+        PipelineRuns — no change needed elsewhere in this recipe.
     - name: judge-model-name
       type: string
       description: "Model identifier for DeepEval's judge, e.g. openai/gpt-oss-120b or llama3.1"
@@ -77,6 +92,8 @@ spec:
       params:
         - name: sut-url
           value: $(params.sut-url)
+        - name: test-file
+          value: $(params.test-file)
         - name: judge-model-name
           value: $(params.judge-model-name)
         - name: judge-model-base-url
@@ -97,8 +114,13 @@ spec:
     # run-pytest above swallows pytest's exit code with `|| true`: the
     # actual pass/fail gate is check-results, not run-suite. A failing
     # finally task still fails the overall PipelineRun, so the gate is
-    # preserved; publish-results runs either way so you can always read
-    # the report.
+    # preserved.
+    #
+    # NOTE: finally tasks run independently of each other (no implicit
+    # ordering between check-results and publish-results below). That's
+    # intentional here — publish-results only reads report files that
+    # check-results doesn't touch — but if that ever changes, add an
+    # explicit runAfter inside this finally block.
     - name: check-results
       taskRef:
         name: check-results
@@ -106,18 +128,21 @@ spec:
         - name: source
           workspace: source
 
-#    - name: publish-results
-#      taskRef:
-#        name: publish-results
-#      params:
-#        - name: results-repo-url
-#          value: $(params.results-repo-url)
-#        - name: results-branch
-#          value: $(params.results-branch)
-#        - name: results-secret-name
-#          value: $(params.results-secret-name)
-#        - name: results-secret-key
-#          value: $(params.results-secret-key)
-#      workspaces:
-#        - name: source
-#          workspace: source
+    # Currently inactive — kept fully wired (params below already flow
+    # from pipelinerun.yaml) so enabling it later is a one-line uncomment,
+    # not a re-plumbing job.
+    # - name: publish-results
+    #   taskRef:
+    #     name: publish-results
+    #   params:
+    #     - name: results-repo-url
+    #       value: $(params.results-repo-url)
+    #     - name: results-branch
+    #       value: $(params.results-branch)
+    #     - name: results-secret-name
+    #       value: $(params.results-secret-name)
+    #     - name: results-secret-key
+    #       value: $(params.results-secret-key)
+    #   workspaces:
+    #     - name: source
+    #       workspace: source

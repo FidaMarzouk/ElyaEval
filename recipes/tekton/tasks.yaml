@@ -11,7 +11,8 @@ spec:
       type: string
     - name: revision
       type: string
-      default: main
+      # no default — pipeline.yaml is the single source of truth (default: dev)
+      # and always passes it explicitly. Standalone TaskRuns must supply it too.
   workspaces:
     - name: source
   steps:
@@ -28,13 +29,8 @@ spec:
 # caching everything in the workspace so run-suite can reuse it without
 # reinstalling. Deliberately NOT installing anything from the SUT's own
 # requirements.txt (no psycopg2, no llama_index, no groq client, ...) —
-# the test process only ever talks to RAG_APP_URL over HTTP, so it doesn't
+# the test process only ever talks to the SUT over HTTP, so it doesn't
 # need the SUT's dependencies at all.
-#
-# elyaeval-package-spec defaults to the framework's own current pinned
-# release — that default is legitimately framework-owned (every recipe
-# instance installs the same template code), not SUT-specific, but it's
-# still a param so a newer tag doesn't require editing this file.
 #
 # pip install --target puts all packages in workspace/.python-packages,
 # persisted across tasks via the shared workspace volume. run-suite sets
@@ -48,8 +44,11 @@ spec:
   params:
     - name: elyaeval-package-spec
       type: string
-      default: "git+https://github.com/FidaMarzouk/ElyaEval.git@v0.1.2"
-      description: pip-installable spec for the elyaeval package (git+https://... or a plain version pin)
+      description: >-
+        pip-installable spec for the elyaeval package (git+https://... or a
+        plain version pin). No default here — pipeline.yaml owns the one
+        legitimate hardcoded default for this recipe; keeping it out of this
+        Task means there's only one place to bump the framework version.
   workspaces:
     - name: source
   steps:
@@ -59,10 +58,10 @@ spec:
       script: |
         #!/bin/sh
         set -eu
-        
+
         # Install system packages needed for pip (git for git+https:// URLs)
         apt-get update && apt-get install -y git
-        
+
         # Install Python deps to workspace/.python-packages
         # --target installs to a directory that becomes part of PYTHONPATH in run-suite
         mkdir -p "$(workspaces.source.path)/.python-packages"
@@ -72,14 +71,17 @@ spec:
           pytest \
           deepeval \
           requests
-        
+
         echo "✓ Dependencies installed to .python-packages"
 
 ---
-# run-suite: the actual test entrypoint. sut-url and the judge-model-*
-# params are the ONLY things this Task knows about a given run — nothing
-# here is specific to any one SUT's stack or any one team's judge-model
-# provider. Change judge-model-* per PipelineRun, not per Task edit.
+# run-suite: the actual test entrypoint. sut-url, test-file, and the
+# judge-model-* params are the ONLY things this Task knows about a given
+# run — nothing here is specific to any one SUT's stack, any one team's
+# judge-model provider, or any one task type. Change per PipelineRun, not
+# per Task edit — that includes adding new task types (agentic, classifier,
+# ...) later: point test-file at whatever `elyaeval init --task-type X`
+# produced, no change needed here.
 # No pip installs here — reuses packages cached by setup-env via PYTHONPATH.
 apiVersion: tekton.dev/v1
 kind: Task
@@ -89,7 +91,16 @@ spec:
   params:
     - name: sut-url
       type: string
-      description: Base URL of the SUT's /query endpoint, reachable from inside this cluster
+      description: Base URL of the SUT's endpoint under test, reachable from inside this cluster
+    - name: test-file
+      type: string
+      description: >-
+        Path (relative to the repo root) of the generated elyaeval test
+        file to run, e.g. test_elyaeval_rag_qa.py or
+        test_elyaeval_agentic_action.py — whatever `elyaeval init
+        --task-type ...` produced for this repo. Not defaulted here on
+        purpose: which file to run is a per-repo, per-task-type decision,
+        not something this shared Task should assume.
     - name: judge-model-name
       type: string
       description: "Model identifier for DeepEval's judge, e.g. openai/gpt-oss-120b or llama3.1"
@@ -98,16 +109,16 @@ spec:
       description: "OpenAI-compatible base URL for the judge model, e.g. https://api.groq.com/openai/v1 or http://localhost:11434/v1"
     - name: judge-model-format
       type: string
-      default: json
       description: LOCAL_MODEL_FORMAT value DeepEval expects for this provider
+      # no default — pipeline.yaml owns it (default: json)
     - name: judge-api-key-secret-name
       type: string
-      default: judge-model-credentials
       description: Name of the Secret holding the judge model's API key
+      # no default — pipeline.yaml owns it (default: judge-model-credentials)
     - name: judge-api-key-secret-key
       type: string
-      default: api-key
       description: Key within that Secret holding the judge model's API key
+      # no default — pipeline.yaml owns it (default: api-key)
   workspaces:
     - name: source
   steps:
@@ -115,7 +126,12 @@ spec:
       image: python:3.11-slim
       workingDir: $(workspaces.source.path)/repo
       env:
-        - name: RAG_APP_URL
+        # APP_URL: base URL of the SUT, passed through from params.sut-url.
+        # Read via os.environ["APP_URL"] inside your own run_app()
+        # implementation (see TODO 2 in the generated test file) — this
+        # Task has no way to reach your SUT itself, it only forwards the
+        # URL into the pytest process's environment.
+        - name: APP_URL
           value: $(params.sut-url)
         - name: PYTHONPATH
           value: $(workspaces.source.path)/.python-packages
@@ -137,21 +153,21 @@ spec:
       script: |
         #!/bin/sh
         set -eu
-        
+
         mkdir -p "$(workspaces.source.path)/report"
         mkdir -p "$(workspaces.source.path)/report/deepeval_results"
-        
+
         # DEEPEVAL_RESULTS_FOLDER: structured JSON per run — score, reason,
         # and cost per metric per test case. junit.xml (below) can only
         # ever carry pass/fail; this is what actually captures the "clearer
         # output" deepeval prints to the terminal locally. Works alongside
         # assert_test()-based gating, no need to switch to evaluate().
         export DEEPEVAL_RESULTS_FOLDER="$(workspaces.source.path)/report/deepeval_results"
-        
+
         # || true so a test-content failure (assertion) still lets us reach
         # check-results and publish-results with the report intact —
         # check-results is what actually fails the PipelineRun.
-        python -m pytest test_elyaeval_rag_qa.py \
+        python -m pytest "$(params.test-file)" \
           --junitxml="$(workspaces.source.path)/report/junit.xml" \
           -q || true
 
@@ -194,11 +210,9 @@ spec:
 # a dedicated results branch in the repo, under ci-reports/<run-name>/.
 # Self-hosted, versioned, diffable across runs — no external storage system.
 #
-# The Secret name/key are params, not fixed — a team can point this at
-# whatever Secret already holds their write token without editing the Task.
-#
-# Falls back to creating an orphan branch on first run (when
-# results-branch doesn't exist yet).
+# Not yet wired into pipeline.yaml's finally block (commented out there) —
+# kept fully defined and param-complete here so enabling it later is a
+# one-line uncomment, not a re-plumbing job.
 apiVersion: tekton.dev/v1
 kind: Task
 metadata:
@@ -210,15 +224,16 @@ spec:
       description: HTTPS repo URL (no credentials) to commit results into, e.g. https://github.com/org/repo.git
     - name: results-branch
       type: string
-      default: ci-results
+      description: Branch of results-repo-url to commit CI result artifacts onto
+      # no default — pipeline.yaml owns it (default: ci-results)
     - name: results-secret-name
       type: string
-      default: git-write-credentials
       description: Name of the Secret holding a repo-write token
+      # no default — pipeline.yaml owns it (default: git-write-credentials)
     - name: results-secret-key
       type: string
-      default: token
       description: Key within that Secret holding the token
+      # no default — pipeline.yaml owns it (default: token)
   workspaces:
     - name: source
   steps:

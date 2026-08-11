@@ -63,7 +63,23 @@ def run_app(user_input: str) -> tuple[str, list[str]]:
         fetched while answering. This is intentionally NOT provided by
         ElyaEval's dataset — only your app knows what it retrieved.
 
-    Example:
+    If your app is called over HTTP (e.g. running as its own service in
+    CI), read its base URL from the APP_URL env var rather than
+    hardcoding it — the run-suite Tekton Task sets this from the
+    pipeline's sut-url param, so the same test file works locally and in
+    CI without editing:
+
+        import os
+        import requests
+        APP_URL = os.environ.get("APP_URL", "http://localhost:8000")
+
+        def run_app(user_input):
+            resp = requests.post(f"{{APP_URL}}/answer", json={{"query": user_input}})
+            resp.raise_for_status()
+            data = resp.json()
+            return data["answer"], data["retrieved_chunks"]
+
+    Or, if calling your app in-process instead of over HTTP:
         result = answer_question(user_input)
         return result.answer, result.retrieved_chunks
     """

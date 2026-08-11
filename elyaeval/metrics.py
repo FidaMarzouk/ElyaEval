@@ -19,6 +19,12 @@ from deepeval.metrics import (
     ContextualRelevancyMetric,
     SummarizationMetric,
     GEval,
+    ToolCorrectnessMetric,
+    ArgumentCorrectnessMetric,
+    TaskCompletionMetric,
+    StepEfficiencyMetric,
+    PlanQualityMetric,
+    PlanAdherenceMetric,
 )
 from deepeval.test_case import SingleTurnParams
 
@@ -74,4 +80,33 @@ QA_CORRECTNESS_METRICS = [
         ],
         threshold=0.7,
     ),
+]
+
+# --- agentic: action layer (component-level) ---------------------------
+# Test-case-based, same as every list above — takes a single LLMTestCase
+# with tools_called (and optionally expected_tools/available_tools) and
+# runs through the existing evaluate_golden() / evaluate(test_cases=[...])
+# path unchanged. Wired to task_type="agentic_action" in cli.py and
+# elyaeval/templates/test_template_agentic.py.tmpl.
+# See elyaeval.run_contracts.AgenticRunResult for what run_app() must return.
+AGENTIC_ACTION_METRICS = [
+    ToolCorrectnessMetric(threshold=0.7),
+    ArgumentCorrectnessMetric(threshold=0.7),
+]
+
+# --- agentic: trajectory layer (trace-level) ----------------------------
+# NOT wired to any template or CLI task_type yet, and cannot be dropped
+# into evaluate_golden() as-is. All four are trace-only metrics: DeepEval
+# requires them to run against a full @observe trace via evals_iterator or
+# an @observe(metrics=[...]) decorator — they do not accept a plain
+# LLMTestCase, so there is no golden-by-golden "run_app() returns a tuple"
+# story for them the way every other preset in this file has. Defined here
+# so the metric choice and thresholds live in one place when the tracing
+# runner gets built; do not reference this constant from cli.py or a
+# template until that exists.
+AGENTIC_TRAJECTORY_METRICS = [
+    TaskCompletionMetric(threshold=0.7),
+    StepEfficiencyMetric(threshold=0.7),
+    PlanQualityMetric(threshold=0.7),
+    PlanAdherenceMetric(threshold=0.7),
 ]

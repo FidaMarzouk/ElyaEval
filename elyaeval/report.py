@@ -23,7 +23,7 @@ from pathlib import Path
 from typing import Optional
 
 from deepeval import evaluate
-from deepeval.evaluate.configs import AsyncConfig, DisplayConfig
+from deepeval.evaluate.configs import AsyncConfig, DisplayConfig, ErrorConfig
 from deepeval.evaluate.types import TestResult
 from deepeval.test_case import LLMTestCase
 from deepeval.dataset import Golden
@@ -117,6 +117,7 @@ def evaluate_golden(
         metrics=metrics,
         display_config=DisplayConfig(show_indicator=False, print_results=False),
         async_config=AsyncConfig(run_async=False),
+        error_config=ErrorConfig(ignore_errors=True),
     )
     test_result = result.test_results[0]
 
