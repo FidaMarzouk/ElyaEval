@@ -127,22 +127,18 @@ spec:
       workspaces:
         - name: source
           workspace: source
-
-    # Currently inactive — kept fully wired (params below already flow
-    # from pipelinerun.yaml) so enabling it later is a one-line uncomment,
-    # not a re-plumbing job.
-    # - name: publish-results
-    #   taskRef:
-    #     name: publish-results
-    #   params:
-    #     - name: results-repo-url
-    #       value: $(params.results-repo-url)
-    #     - name: results-branch
-    #       value: $(params.results-branch)
-    #     - name: results-secret-name
-    #       value: $(params.results-secret-name)
-    #     - name: results-secret-key
-    #       value: $(params.results-secret-key)
-    #   workspaces:
-    #     - name: source
-    #       workspace: source
+    - name: publish-results
+      taskRef:
+        name: publish-results
+      params:
+        - name: results-repo-url
+          value: $(params.results-repo-url)
+        - name: results-branch
+          value: $(params.results-branch)
+        - name: results-secret-name
+          value: $(params.results-secret-name)
+        - name: results-secret-key
+          value: $(params.results-secret-key)
+      workspaces:
+        - name: source
+          workspace: source

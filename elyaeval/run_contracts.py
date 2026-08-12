@@ -39,14 +39,12 @@ class AgenticRunResult(NamedTuple):
         or output-matching strictness to have something to check.
     available_tools: optional. Every ToolCall your agent COULD have called
         for this input — only needed if you want a metric to evaluate tool
-        *selection* (did it pick the right one out of what was available),
-        not just correctness of the ones it did call. Leave as None if
-        you're not using that.
+        *selection* not just correctness of the ones it did call. 
+        Leave as None if you're not using that.
 
     Not for trajectory-level metrics (TaskCompletion, StepEfficiency,
     PlanQuality, PlanAdherence) — those read a full @observe trace, not a
-    single run_app() call, and need a different runner. See the note next
-    to AGENTIC_TRAJECTORY_METRICS in elyaeval/metrics.py.
+    single run_app() call, and need a different runner.
     """
 
     actual_output: str

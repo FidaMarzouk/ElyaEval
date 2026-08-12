@@ -170,6 +170,12 @@ spec:
         python -m pytest "$(params.test-file)" \
           --junitxml="$(workspaces.source.path)/report/junit.xml" \
           -q || true
+        # elyaeval's evaluate_golden() writes its CSV relative to pytest's
+        # cwd (this repo's root, per REPORT_CSV in the generated test
+        # file) — a different directory than the workspace-level report/
+        # above. Copy it over so publish-results (which only reads from
+        # the workspace-level report/) picks it up too.
+        cp report/results_*.csv "$(workspaces.source.path)/report/" 2>/dev/null || true
 
 ---
 # check-results: gate on the JUnit output — pass/fail only, which is all
@@ -269,6 +275,10 @@ spec:
         cp "$(workspaces.source.path)/report/junit.xml" "$WORKDIR/$RUN_DIR/junit.xml"
         # Structured score/reason/cost detail — the part junit.xml can't carry
         cp -r "$(workspaces.source.path)/report/deepeval_results/." "$WORKDIR/$RUN_DIR/" 2>/dev/null || true
+
+        # elyaeval's per-metric CSV (score/threshold/success/reason/error) — copied
+        # into the shared report/ dir by run-suite, see tasks.yaml for why
+        cp "$(workspaces.source.path)/report/results_"*.csv "$WORKDIR/$RUN_DIR/" 2>/dev/null || true
 
         cd "$WORKDIR"
         git config user.email "ci-bot@elyaeval.local"

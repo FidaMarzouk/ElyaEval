@@ -104,10 +104,7 @@ def evaluate_golden(
     Runs `metrics` against `test_case` via evaluate() with test_cases=[test_case]
     (a batch of exactly one), appends one CSV row per metric to csv_path, and
     returns the TestResult so the caller decides how to fail the pytest test.
-    print_results/show_indicator are disabled — deepeval's own console
-    dump of every score+reason is what currently ends up embedded in
-    junit.xml on failure; the CSV is the structured version of that same
-    information, so the console copy is redundant here.
+    print_results/show_indicator are disabled
     """
     gid = golden_id or _golden_id(golden, fallback_index)
     priority = (golden.additional_metadata or {}).get("priority", "")

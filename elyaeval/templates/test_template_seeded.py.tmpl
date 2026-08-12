@@ -21,7 +21,7 @@ retrieve from the corpus it already has.
 
 WHAT YOU NEED TO FILL IN (search for TODO):
   1. Import your app's entrypoint function.
-  2. Implement run_app() to call it and return (actual_output, retrieval_context).
+  2. Implement run_app() to call it and return a RAGRunResult.
   3. Implement _ingest_passage / _teardown_passages for YOUR storage backend
      (see elyaeval.fixtures.make_golden_context_fixture for the contract).
 
@@ -38,6 +38,7 @@ import pytest
 
 from elyaeval import load_standard_dataset, make_golden_context_fixture, evaluate_golden
 from elyaeval.metrics import {metrics_constant}
+from elyaeval.run_contracts import RAGRunResult
 
 REPORT_CSV = Path("report/results_{task_type}.csv")
 
@@ -45,11 +46,12 @@ REPORT_CSV = Path("report/results_{task_type}.csv")
 # from myapp.pipeline import answer_question
 
 
-def run_app(user_input: str) -> tuple[str, list[str]]:
+def run_app(user_input: str) -> RAGRunResult:
     """
     TODO 2: call your own app here.
 
-    Must return (actual_output, retrieval_context):
+    Must return a RAGRunResult(actual_output, retrieval_context) — see
+    elyaeval/run_contracts.py for the field-by-field contract:
       - actual_output: the final string your app returns for `user_input`.
       - retrieval_context: the list of chunk strings your app's retriever
         fetched while answering. This is intentionally NOT provided by
@@ -69,11 +71,17 @@ def run_app(user_input: str) -> tuple[str, list[str]]:
             resp = requests.post(f"{{APP_URL}}/answer", json={{"query": user_input}})
             resp.raise_for_status()
             data = resp.json()
-            return data["answer"], data["retrieved_chunks"]
+            return RAGRunResult(
+                actual_output=data["answer"],
+                retrieval_context=data["retrieved_chunks"],
+            )
 
     Or, if calling your app in-process instead of over HTTP:
         result = answer_question(user_input)
-        return result.answer, result.retrieved_chunks
+        return RAGRunResult(
+            actual_output=result.answer,
+            retrieval_context=result.retrieved_chunks,
+        )
     """
     raise NotImplementedError("Wire this up to your app before running the suite.")
 
@@ -109,14 +117,14 @@ ingest_golden_contexts = make_golden_context_fixture(GOLDENS, _ingest_passage, _
     ids=[g.additional_metadata.get("priority", "") + "_" + str(i) for i, g in enumerate(GOLDENS)],
 )
 def test_{task_type}(golden):
-    actual_output, retrieval_context = run_app(golden.input)
+    run_result = run_app(golden.input)
 
     test_case = LLMTestCase(
         input=golden.input,
-        actual_output=actual_output,
+        actual_output=run_result.actual_output,
         expected_output=golden.expected_output,
         context=golden.context,
-        retrieval_context=retrieval_context,
+        retrieval_context=run_result.retrieval_context,
     )
 
     # One evaluate() call per golden (test_cases=[test_case], never the
