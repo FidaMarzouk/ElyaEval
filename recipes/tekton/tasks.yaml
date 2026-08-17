@@ -215,10 +215,7 @@ spec:
 # publish-results: commits the JUnit report + structured DeepEval JSON to
 # a dedicated results branch in the repo, under ci-reports/<run-name>/.
 # Self-hosted, versioned, diffable across runs — no external storage system.
-#
-# Not yet wired into pipeline.yaml's finally block (commented out there) —
-# kept fully defined and param-complete here so enabling it later is a
-# one-line uncomment, not a re-plumbing job.
+
 apiVersion: tekton.dev/v1
 kind: Task
 metadata:

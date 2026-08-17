@@ -38,6 +38,16 @@ _TASK_TYPES_WITHOUT_CORPUS_MODE = {
     "agentic_action": "test_template_agentic.py.tmpl",
 }
 
+# --eval-mode is orthogonal to --corpus-mode: it picks e2e (HTTP, one flat
+# TestResult per golden, via report.py/evaluate_golden) vs component
+# (in-process, span-aware, via tracing_report.py/TracedRunner). "e2e" is
+# the existing behavior and stays the default so nothing already generated
+# changes. Component mode has exactly one template regardless of task
+# type — it runs the SUT's traced entrypoint in-process rather than
+# retrieving from a corpus, so --corpus-mode doesn't apply to it either
+# (see the check in init() below).
+_COMPONENT_TEMPLATE = "test_template_component.py.tmpl"
+
 _CI_TEMPLATE = "pipelinerun_template.yaml.tmpl"
 
 
@@ -45,27 +55,39 @@ def _load_template(filename: str) -> str:
     return (resources.files("elyaeval") / "templates" / filename).read_text()
 
 
-def _template_filename(task_type: str, corpus_mode: str) -> str:
+def _template_filename(task_type: str, corpus_mode: str, eval_mode: str) -> str:
+    if eval_mode == "component":
+        return _COMPONENT_TEMPLATE
     if task_type in _TASK_TYPES_WITHOUT_CORPUS_MODE:
         return _TASK_TYPES_WITHOUT_CORPUS_MODE[task_type]
     return _CORPUS_MODE_TO_TEMPLATE[corpus_mode]
 
 
-def _default_test_filename(task_type: str) -> str:
+def _default_test_filename(task_type: str, eval_mode: str = "e2e") -> str:
     """The naming convention every generated test file follows — the single
     place that convention is defined, so init() and init_ci() can't drift
     out of sync on what a task type's default filename looks like."""
-    return f"test_elyaeval_{task_type}.py"
+    suffix = "_component" if eval_mode == "component" else ""
+    return f"test_elyaeval_{task_type}{suffix}.py"
 
 
 def _load_ci_template() -> str:
     return (resources.files("elyaeval") / "templates" / _CI_TEMPLATE).read_text()
 
 
-def init(task_type: str, ci_stage: str, output: str, corpus_mode: str = "existing") -> Path:
+def init(
+    task_type: str,
+    ci_stage: str,
+    output: str,
+    corpus_mode: str = "existing",
+    eval_mode: str = "e2e",
+) -> Path:
     if task_type not in _TASK_TYPE_TO_METRICS_CONSTANT:
         valid = ", ".join(_TASK_TYPE_TO_METRICS_CONSTANT)
         raise SystemExit(f"Unknown --task-type '{task_type}'. Valid options: {valid}")
+
+    if eval_mode not in ("e2e", "component"):
+        raise SystemExit(f"Unknown --eval-mode '{eval_mode}'. Valid options: e2e, component")
 
     if corpus_mode not in _CORPUS_MODE_TO_TEMPLATE:
         valid = ", ".join(_CORPUS_MODE_TO_TEMPLATE)
@@ -77,6 +99,13 @@ def init(task_type: str, ci_stage: str, output: str, corpus_mode: str = "existin
             f"(no retrieval corpus involved) — omit --corpus-mode."
         )
 
+    if eval_mode == "component" and corpus_mode != "existing":
+        raise SystemExit(
+            "--corpus-mode is not applicable to --eval-mode=component — component mode "
+            "always runs your app's traced entrypoint in-process against whatever corpus "
+            "it already has (seeding doesn't apply here). Omit --corpus-mode."
+        )
+
     n_matched = len(load_standard_dataset(task_type=task_type, ci_stage=ci_stage))
     if n_matched == 0:
         print(
@@ -86,7 +115,14 @@ def init(task_type: str, ci_stage: str, output: str, corpus_mode: str = "existin
             f"Check `elyaeval.dataset.load_standard_dataset` filters or pass a different --ci-stage."
         )
 
-    if corpus_mode == "existing" and task_type not in _TASK_TYPES_WITHOUT_CORPUS_MODE:
+    if eval_mode == "component":
+        print(
+            "Note: generating in component mode — this suite calls your app's traced "
+            "entrypoint IN-PROCESS (no HTTP) and scores each @observe'd span "
+            "separately. It's meant to run alongside the e2e suite, not replace it — "
+            "see the comment at the top of the generated file."
+        )
+    elif corpus_mode == "existing" and task_type not in _TASK_TYPES_WITHOUT_CORPUS_MODE:
         print(
             "Note: generating in existing-corpus mode — GOLDENS defaults to the shared "
             "standard dataset, which is a generic benchmark, not written against your "
@@ -95,7 +131,7 @@ def init(task_type: str, ci_stage: str, output: str, corpus_mode: str = "existin
         )
 
     metrics_constant = _TASK_TYPE_TO_METRICS_CONSTANT[task_type]
-    template_filename = _template_filename(task_type, corpus_mode)
+    template_filename = _template_filename(task_type, corpus_mode, eval_mode)
     rendered = _load_template(template_filename).format(
         task_type=task_type,
         ci_stage=ci_stage,
@@ -180,6 +216,19 @@ def main():
             "leg (currently: agentic_action) — omit this flag for those."
         ),
     )
+    p_init.add_argument(
+        "--eval-mode",
+        choices=["e2e", "component"],
+        default="e2e",
+        help=(
+            "'e2e' (default): run_app() calls your app over HTTP and produces one flat "
+            "TestResult per golden (report.py/evaluate_golden). "
+            "'component': imports your app's traced entrypoint IN-PROCESS and scores "
+            "each @observe'd span separately (tracing_report.py/TracedRunner) — meant "
+            "to run alongside the e2e suite, not replace it. --corpus-mode does not "
+            "apply to component mode — omit it."
+        ),
+    )
 
     p_init_ci = sub.add_parser(
         "init-ci",
@@ -233,11 +282,16 @@ def main():
     args = parser.parse_args()
 
     if args.command == "init":
-        output = args.output or _default_test_filename(args.task_type)
-        out_path = init(args.task_type, args.ci_stage, output, args.corpus_mode)
+        output = args.output or _default_test_filename(args.task_type, args.eval_mode)
+        out_path = init(args.task_type, args.ci_stage, output, args.corpus_mode, args.eval_mode)
         print(f"Wrote {out_path}")
         print("Next steps:")
-        if args.task_type == "agentic_action":
+        if args.eval_mode == "component":
+            print(f"  1. Open {out_path} and fill in TODO 1 and TODO 2 "
+                  f"(import your traced entrypoint + implement call_sut()).")
+            print(f"  2. Point GOLDENS at your own goldens file (dataset_path=...).")
+            print(f"  3. Run: deepeval test run {out_path}")
+        elif args.task_type == "agentic_action":
             print(f"  1. Open {out_path} and fill in TODO 1, TODO 2 (import + run_app()), "
                   f"and TODO 3 (expected tools) if you're scoring against ground truth.")
             print(f"  2. Point GOLDENS at your own goldens file (dataset_path=...).")
