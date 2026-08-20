@@ -9,7 +9,7 @@ spec:
       description: Repo containing the generated elyaeval test suite
     - name: revision
       type: string
-      description: Git ref (branch, tag, or SHA) to check out from repo-url
+      default: dev
     - name: elyaeval-package-spec
       type: string
       default: "git+https://github.com/FidaMarzouk/ElyaEval.git@eval"
@@ -24,27 +24,53 @@ spec:
       description: Base URL of the SUT's /query endpoint, reachable from inside the cluster
     - name: test-file
       type: string
+      default: test_elyaeval_rag_qa.py
       description: >-
         Path (relative to the repo root) of the generated elyaeval test
         file to run — output of `elyaeval init --task-type ...` in the SUT
-        repo. Use the rag_qa filename for that task type; pass a different
-        value here once other task types (agentic, classifier, ...) get
-        their own PipelineRuns — no change needed elsewhere in this recipe.
+        repo. Defaults to the rag_qa filename since that's the only task
+        type currently wired into this recipe; pass a different value here
+        once other task types (agentic, classifier, ...) get their own
+        PipelineRuns — no change needed elsewhere in this recipe.
+    - name: judge-provider
+      type: string
+      default: local
+      description: >-
+        Which DeepEval judge-model provider to use: "local"
+        (OpenAI-compatible server — Ollama, vLLM, LM Studio, Groq's
+        OpenAI-compat endpoint), "anthropic", or "openai". Defaults to
+        "local" so every existing PipelineRun that doesn't set this keeps
+        behaving exactly as before. See run-suite's Task-level comment in
+        tasks.yaml for what env vars each option wires up.
     - name: judge-model-name
       type: string
-      description: "Model identifier for DeepEval's judge, e.g. openai/gpt-oss-120b or llama3.1"
+      description: >-
+        Model identifier for DeepEval's judge — meaning depends on
+        judge-provider (e.g. llama3.1 / openai/gpt-oss-120b for "local",
+        claude-sonnet-4-6 for "anthropic", gpt-4.1 for "openai").
     - name: judge-model-base-url
       type: string
-      description: "OpenAI-compatible base URL for the judge model"
+      default: ""
+      description: >-
+        OpenAI-compatible base URL for the judge model. ONLY required when
+        judge-provider is "local" — leave empty for "anthropic"/"openai".
     - name: judge-model-format
       type: string
-      description: "Response format for the judge model, e.g. json"
+      default: json
+      description: >-
+        LOCAL_MODEL_FORMAT value DeepEval expects. ONLY consulted when
+        judge-provider is "local".
     - name: judge-api-key-secret-name
       type: string
-      description: "Name of the k8s Secret holding the judge model API key"
+      default: judge-model-credentials
+      description: >-
+        Name of the Secret holding the judge model's API key. Same Secret
+        mechanism is reused across all providers — for "anthropic"/"openai"
+        it must hold a real key; for "local" against Ollama it just needs
+        to exist (Ollama doesn't validate the value).
     - name: judge-api-key-secret-key
       type: string
-      description: "Key within the judge API key Secret's data"
+      default: api-key
     - name: nexus-base-url
       type: string
       default: "http://host.docker.internal:8081/repository/eval-results"
@@ -58,13 +84,13 @@ spec:
       description: "Subfolder / project namespace under the raw repo, e.g. project-x — one per SUT/team for access isolation"
     - name: nexus-secret-name
       type: string
-      description: "Name of the k8s Secret holding Nexus credentials"
+      default: nexus-credentials
     - name: nexus-user-secret-key
       type: string
-      description: "Key within the Nexus Secret's data holding the username"
+      default: username
     - name: nexus-token-secret-key
       type: string
-      description: "Key within the Nexus Secret's data holding the token"
+      default: token
   workspaces:
     - name: source
   tasks:
@@ -100,6 +126,8 @@ spec:
           value: $(params.sut-url)
         - name: test-file
           value: $(params.test-file)
+        - name: judge-provider
+          value: $(params.judge-provider)
         - name: judge-model-name
           value: $(params.judge-model-name)
         - name: judge-model-base-url

@@ -76,12 +76,33 @@ spec:
 
 ---
 # run-suite: the actual test entrypoint. sut-url, test-file, and the
-# judge-model-* params are the ONLY things this Task knows about a given
-# run — nothing here is specific to any one SUT's stack, any one team's
-# judge-model provider, or any one task type. Change per PipelineRun, not
-# per Task edit — that includes adding new task types (agentic, classifier,
-# ...) later: point test-file at whatever `elyaeval init --task-type X`
-# produced, no change needed here.
+# judge-* params are the ONLY things this Task knows about a given run —
+# nothing here is specific to any one SUT's stack, any one task type, or
+# (as of this version) any one judge-model provider. Change per
+# PipelineRun, not per Task edit — that includes adding new task types
+# (agentic, classifier, ...) or new judge providers later.
+#
+# JUDGE PROVIDER WIRING
+# ----------------------
+# Different DeepEval providers need DIFFERENT sets of env vars, not just
+# different values — an OpenAI-compatible local server (Ollama, vLLM,
+# LM Studio, Groq's OpenAI-compat endpoint) needs USE_LOCAL_MODEL +
+# LOCAL_MODEL_BASE_URL + LOCAL_MODEL_FORMAT; Anthropic needs
+# USE_ANTHROPIC_MODEL + ANTHROPIC_MODEL_NAME + ANTHROPIC_API_KEY; OpenAI
+# just needs OPENAI_MODEL_NAME + OPENAI_API_KEY. Because of that, this
+# Task does NOT declare provider-specific env vars in the static `env:`
+# block below (a secretKeyRef pointing at a key that doesn't apply to the
+# chosen provider would fail the pod at scheduling, not at test time).
+# Instead it declares exactly ONE generic secret-sourced var (JUDGE_API_KEY)
+# that always exists, and the `run-pytest` script below branches on
+# judge-provider to export the correct provider-specific vars from it
+# before pytest runs.
+#
+# judge-api-key-secret-name/key are reused across all providers (same
+# Secret, same mechanism) — only its *contents* need to be a real key for
+# anthropic/openai; for local/Ollama the Secret still needs to exist, but
+# Ollama doesn't validate the value, so a placeholder is fine there.
+#
 # No pip installs here — reuses packages cached by setup-env via PYTHONPATH.
 apiVersion: tekton.dev/v1
 kind: Task
@@ -98,16 +119,38 @@ spec:
         Path (relative to the repo root) of the generated elyaeval test
         file to run, e.g. test_elyaeval_rag_qa.py or
         test_elyaeval_agentic_action.py — whatever `elyaeval init
-        --task-type ...` produced for this repo.
+        --task-type ...` produced for this repo. Not defaulted here on
+        purpose: which file to run is a per-repo, per-task-type decision,
+        not something this shared Task should assume.
+    - name: judge-provider
+      type: string
+      description: >-
+        Which DeepEval judge-model provider to configure: "local"
+        (OpenAI-compatible server — Ollama, vLLM, LM Studio, Groq's
+        OpenAI-compat endpoint), "anthropic", or "openai". Determines
+        which env vars run-pytest exports below — see the Task-level
+        comment above. No default here — pipeline.yaml owns it.
     - name: judge-model-name
       type: string
-      description: "Model identifier for DeepEval's judge, e.g. openai/gpt-oss-120b or llama3.1"
+      description: >-
+        Model identifier for DeepEval's judge. Meaning depends on
+        judge-provider: an OpenAI-compat model/tag for "local" (e.g.
+        llama3.1, openai/gpt-oss-120b), an Anthropic model for
+        "anthropic" (e.g. claude-sonnet-4-6), or an OpenAI model for
+        "openai" (e.g. gpt-4.1).
     - name: judge-model-base-url
       type: string
-      description: "OpenAI-compatible base URL for the judge model, e.g. https://api.groq.com/openai/v1 or http://localhost:11434/v1"
+      description: >-
+        OpenAI-compatible base URL for the judge model. ONLY consulted
+        when judge-provider is "local" (e.g. https://api.groq.com/openai/v1
+        or http://localhost:11434/v1) — ignored for "anthropic"/"openai",
+        which talk to their providers' fixed APIs directly. Safe to leave
+        empty for those.
     - name: judge-model-format
       type: string
-      description: LOCAL_MODEL_FORMAT value DeepEval expects for this provider
+      description: >-
+        LOCAL_MODEL_FORMAT value DeepEval expects for this provider. ONLY
+        consulted when judge-provider is "local" — ignored otherwise.
       # no default — pipeline.yaml owns it (default: json)
     - name: judge-api-key-secret-name
       type: string
@@ -135,15 +178,12 @@ spec:
           value: $(workspaces.source.path)/.python-packages
         - name: DEEPEVAL_DISABLE_DOTENV
           value: "1"
-        - name: USE_LOCAL_MODEL
-          value: "True"
-        - name: LOCAL_MODEL_NAME
-          value: $(params.judge-model-name)
-        - name: LOCAL_MODEL_BASE_URL
-          value: $(params.judge-model-base-url)
-        - name: LOCAL_MODEL_FORMAT
-          value: $(params.judge-model-format)
-        - name: LOCAL_MODEL_API_KEY
+        # JUDGE_API_KEY: the one provider-agnostic secret-sourced value.
+        # The script below re-exports it under the correct provider-specific
+        # env var name (LOCAL_MODEL_API_KEY / ANTHROPIC_API_KEY /
+        # OPENAI_API_KEY) based on judge-provider — nothing provider-specific
+        # is declared statically here.
+        - name: JUDGE_API_KEY
           valueFrom:
             secretKeyRef:
               name: $(params.judge-api-key-secret-name)
@@ -151,6 +191,33 @@ spec:
       script: |
         #!/bin/sh
         set -eu
+
+        # --- Judge provider wiring -----------------------------------
+        # Exactly one of these branches runs, exporting only the env vars
+        # that provider actually needs. See the Task-level comment above
+        # for why this can't live in the static env: block.
+        case "$(params.judge-provider)" in
+          local)
+            export USE_LOCAL_MODEL=True
+            export LOCAL_MODEL_NAME="$(params.judge-model-name)"
+            export LOCAL_MODEL_BASE_URL="$(params.judge-model-base-url)"
+            export LOCAL_MODEL_FORMAT="$(params.judge-model-format)"
+            export LOCAL_MODEL_API_KEY="$JUDGE_API_KEY"
+            ;;
+          anthropic)
+            export USE_ANTHROPIC_MODEL=1
+            export ANTHROPIC_MODEL_NAME="$(params.judge-model-name)"
+            export ANTHROPIC_API_KEY="$JUDGE_API_KEY"
+            ;;
+          openai)
+            export OPENAI_MODEL_NAME="$(params.judge-model-name)"
+            export OPENAI_API_KEY="$JUDGE_API_KEY"
+            ;;
+          *)
+            echo "Unknown judge-provider '$(params.judge-provider)' — expected local, anthropic, or openai" >&2
+            exit 1
+            ;;
+        esac
 
         mkdir -p "$(workspaces.source.path)/report"
         mkdir -p "$(workspaces.source.path)/report/deepeval_results"
@@ -201,6 +268,7 @@ spec:
             sys.exit(1)
         EOF
       
+
 ---
 # report-results: uploads the run's CSV report to Nexus's raw hosted repository.
 # One upload per run, under a unique run-id filename. 
@@ -252,13 +320,25 @@ spec:
         set -eu
 
         RUN_ID="$(params.run-id)"
-        CSV="$(workspaces.source.path)/report/results_rag_qa.csv"
         BASE="$(params.nexus-base-url)/$(params.nexus-project)"
 
-        if [ -f "$CSV" ]; then
+        # Don't assume the task type: report.py names the CSV
+        # results_<task_type>.csv, and this Task runs for every task type
+        # (rag_qa, retrieval, summarization, qa_correctness, ...), so the
+        # filename varies per run-suite invocation. Pick up whatever
+        # results_*.csv actually landed in report/ instead of hardcoding
+        # one task type's name.
+        CSV_COUNT=$(find "$(workspaces.source.path)/report" -maxdepth 1 -name 'results_*.csv' 2>/dev/null | wc -l)
+
+        if [ "$CSV_COUNT" -eq 0 ]; then
+          echo "No results_*.csv found under $(workspaces.source.path)/report — skipping upload"
+        elif [ "$CSV_COUNT" -gt 1 ]; then
+          echo "Found $CSV_COUNT results_*.csv files — expected exactly one per run, refusing to guess which to upload:" >&2
+          find "$(workspaces.source.path)/report" -maxdepth 1 -name 'results_*.csv' >&2
+          exit 1
+        else
+          CSV=$(find "$(workspaces.source.path)/report" -maxdepth 1 -name 'results_*.csv')
           curl -u "${NEXUS_USER}:${NEXUS_TOKEN}" --fail \
             --upload-file "$CSV" "$BASE/$RUN_ID.csv"
-          echo "✓ Uploaded to $BASE/$RUN_ID.csv"
-        else
-          echo "No CSV found at $CSV — skipping upload"
+          echo "✓ Uploaded $CSV to $BASE/$RUN_ID.csv"
         fi
