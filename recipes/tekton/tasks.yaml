@@ -98,9 +98,7 @@ spec:
         Path (relative to the repo root) of the generated elyaeval test
         file to run, e.g. test_elyaeval_rag_qa.py or
         test_elyaeval_agentic_action.py — whatever `elyaeval init
-        --task-type ...` produced for this repo. Not defaulted here on
-        purpose: which file to run is a per-repo, per-task-type decision,
-        not something this shared Task should assume.
+        --task-type ...` produced for this repo.
     - name: judge-model-name
       type: string
       description: "Model identifier for DeepEval's judge, e.g. openai/gpt-oss-120b or llama3.1"
@@ -160,8 +158,7 @@ spec:
         # DEEPEVAL_RESULTS_FOLDER: structured JSON per run — score, reason,
         # and cost per metric per test case. junit.xml (below) can only
         # ever carry pass/fail; this is what actually captures the "clearer
-        # output" deepeval prints to the terminal locally. Works alongside
-        # assert_test()-based gating, no need to switch to evaluate().
+        # output" deepeval prints to the terminal locally.
         export DEEPEVAL_RESULTS_FOLDER="$(workspaces.source.path)/report/deepeval_results"
 
         # || true so a test-content failure (assertion) still lets us reach
@@ -170,19 +167,12 @@ spec:
         python -m pytest "$(params.test-file)" \
           --junitxml="$(workspaces.source.path)/report/junit.xml" \
           -q || true
-        # elyaeval's evaluate_golden() writes its CSV relative to pytest's
-        # cwd (this repo's root, per REPORT_CSV in the generated test
-        # file) — a different directory than the workspace-level report/
-        # above. Copy it over so publish-results (which only reads from
-        # the workspace-level report/) picks it up too.
         cp report/results_*.csv "$(workspaces.source.path)/report/" 2>/dev/null || true
 
 ---
 # check-results: gate on the JUnit output — pass/fail only, which is all
-# this needs to enforce a hard gate. Score/reason/cost detail lives in
-# report/deepeval_results/*.json (from DEEPEVAL_RESULTS_FOLDER in
-# run-suite) — see publish-results for that side of it. A future
-# cost-budget Task would parse that JSON instead of adding logic here.
+# this needs to enforce a hard gate.
+# A future cost-budget Task would parse that JSON instead of adding logic here.
 apiVersion: tekton.dev/v1
 kind: Task
 metadata:
@@ -210,78 +200,65 @@ spec:
         if failures or errors:
             sys.exit(1)
         EOF
-
+      
 ---
-# publish-results: commits the JUnit report + structured DeepEval JSON to
-# a dedicated results branch in the repo, under ci-reports/<run-name>/.
-# Self-hosted, versioned, diffable across runs — no external storage system.
+# report-results: uploads the run's CSV report to Nexus's raw hosted repository.
+# One upload per run, under a unique run-id filename. 
+# "Current state" is just whichever file is newest
 
 apiVersion: tekton.dev/v1
 kind: Task
 metadata:
-  name: publish-results
+  name: report-results
 spec:
   params:
-    - name: results-repo-url
+    - name: nexus-base-url
       type: string
-      description: HTTPS repo URL (no credentials) to commit results into, e.g. https://github.com/org/repo.git
-    - name: results-branch
+      description: "Base URL of the Nexus raw hosted repo, e.g. https://nexus.elyadata.internal/repository/eval-results"
+    - name: nexus-project
       type: string
-      description: Branch of results-repo-url to commit CI result artifacts onto
-      # no default — pipeline.yaml owns it (default: ci-results)
-    - name: results-secret-name
+      description: "Subfolder / project namespace under the raw repo, e.g. project-x"
+    - name: nexus-secret-name
       type: string
-      description: Name of the Secret holding a repo-write token
-      # no default — pipeline.yaml owns it (default: git-write-credentials)
-    - name: results-secret-key
+      description: Name of the Secret holding Nexus upload credentials
+      # no default — pipeline.yaml owns it (default: nexus-credentials)
+    - name: nexus-user-secret-key
       type: string
-      description: Key within that Secret holding the token
-      # no default — pipeline.yaml owns it (default: token)
+      description: Key within that Secret holding the Nexus username
+    - name: nexus-token-secret-key
+      type: string
+      description: Key within that Secret holding the Nexus token/password
+    - name: run-id
+      type: string
+      description: "Unique identifier for this run, used as the uploaded filename"
   workspaces:
     - name: source
   steps:
-    - name: commit-report
-      image: alpine/git:2.45.2
+    - name: upload-report
+      image: curlimages/curl:8.9.1
       env:
-        - name: GIT_TOKEN
+        - name: NEXUS_USER
           valueFrom:
             secretKeyRef:
-              name: $(params.results-secret-name)
-              key: $(params.results-secret-key)
+              name: $(params.nexus-secret-name)
+              key: $(params.nexus-user-secret-key)
+        - name: NEXUS_TOKEN
+          valueFrom:
+            secretKeyRef:
+              name: $(params.nexus-secret-name)
+              key: $(params.nexus-token-secret-key)
       script: |
         #!/bin/sh
         set -eu
 
-        AUTH_URL=$(echo "$(params.results-repo-url)" | sed "s#https://#https://x-access-token:${GIT_TOKEN}@#")
-        WORKDIR=/tmp/results-repo
-        RUN_DIR="ci-reports/$(context.taskRun.name)"
+        RUN_ID="$(params.run-id)"
+        CSV="$(workspaces.source.path)/report/results_rag_qa.csv"
+        BASE="$(params.nexus-base-url)/$(params.nexus-project)"
 
-        # Clone the results branch if it exists; otherwise start an orphan branch
-        if git clone --branch "$(params.results-branch)" --depth 1 "$AUTH_URL" "$WORKDIR" 2>/dev/null; then
-          echo "Cloned existing $(params.results-branch) branch"
+        if [ -f "$CSV" ]; then
+          curl -u "${NEXUS_USER}:${NEXUS_TOKEN}" --fail \
+            --upload-file "$CSV" "$BASE/$RUN_ID.csv"
+          echo "✓ Uploaded to $BASE/$RUN_ID.csv"
         else
-          echo "$(params.results-branch) doesn't exist yet — creating it"
-          git clone --depth 1 "$AUTH_URL" "$WORKDIR"
-          cd "$WORKDIR"
-          git checkout --orphan "$(params.results-branch)"
-          git rm -rf . > /dev/null 2>&1 || true
-          cd -
+          echo "No CSV found at $CSV — skipping upload"
         fi
-
-        mkdir -p "$WORKDIR/$RUN_DIR"
-        cp "$(workspaces.source.path)/report/junit.xml" "$WORKDIR/$RUN_DIR/junit.xml"
-        # Structured score/reason/cost detail — the part junit.xml can't carry
-        cp -r "$(workspaces.source.path)/report/deepeval_results/." "$WORKDIR/$RUN_DIR/" 2>/dev/null || true
-
-        # elyaeval's per-metric CSV (score/threshold/success/reason/error) — copied
-        # into the shared report/ dir by run-suite, see tasks.yaml for why
-        cp "$(workspaces.source.path)/report/results_"*.csv "$WORKDIR/$RUN_DIR/" 2>/dev/null || true
-
-        cd "$WORKDIR"
-        git config user.email "ci-bot@elyaeval.local"
-        git config user.name "elyaeval-ci-bot"
-        git add "$RUN_DIR"
-        git commit -m "CI results: $(context.taskRun.name)"
-        git push origin "$(params.results-branch)"
-
-        echo "Published to $(params.results-repo-url) @ $(params.results-branch)/$RUN_DIR"

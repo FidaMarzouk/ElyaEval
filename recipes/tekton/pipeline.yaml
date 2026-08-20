@@ -9,7 +9,7 @@ spec:
       description: Repo containing the generated elyaeval test suite
     - name: revision
       type: string
-      default: dev
+      description: Git ref (branch, tag, or SHA) to check out from repo-url
     - name: elyaeval-package-spec
       type: string
       default: "git+https://github.com/FidaMarzouk/ElyaEval.git@eval"
@@ -24,14 +24,12 @@ spec:
       description: Base URL of the SUT's /query endpoint, reachable from inside the cluster
     - name: test-file
       type: string
-      default: test_elyaeval_rag_qa.py
       description: >-
         Path (relative to the repo root) of the generated elyaeval test
         file to run — output of `elyaeval init --task-type ...` in the SUT
-        repo. Defaults to the rag_qa filename since that's the only task
-        type currently wired into this recipe; pass a different value here
-        once other task types (agentic, classifier, ...) get their own
-        PipelineRuns — no change needed elsewhere in this recipe.
+        repo. Use the rag_qa filename for that task type; pass a different
+        value here once other task types (agentic, classifier, ...) get
+        their own PipelineRuns — no change needed elsewhere in this recipe.
     - name: judge-model-name
       type: string
       description: "Model identifier for DeepEval's judge, e.g. openai/gpt-oss-120b or llama3.1"
@@ -40,25 +38,33 @@ spec:
       description: "OpenAI-compatible base URL for the judge model"
     - name: judge-model-format
       type: string
-      default: json
+      description: "Response format for the judge model, e.g. json"
     - name: judge-api-key-secret-name
       type: string
-      default: judge-model-credentials
+      description: "Name of the k8s Secret holding the judge model API key"
     - name: judge-api-key-secret-key
       type: string
-      default: api-key
-    - name: results-repo-url
+      description: "Key within the judge API key Secret's data"
+    - name: nexus-base-url
       type: string
-      description: HTTPS repo URL (no credentials) to commit CI results into
-    - name: results-branch
+      default: "http://host.docker.internal:8081/repository/eval-results"
+      description: >-
+        Base URL of the Nexus raw hosted repo. Like elyaeval-package-spec
+        above, this is a legitimate shared default — one Nexus instance
+        serves every project — override only for a different Nexus
+        environment.
+    - name: nexus-project
       type: string
-      default: ci-results
-    - name: results-secret-name
+      description: "Subfolder / project namespace under the raw repo, e.g. project-x — one per SUT/team for access isolation"
+    - name: nexus-secret-name
       type: string
-      default: git-write-credentials
-    - name: results-secret-key
+      description: "Name of the k8s Secret holding Nexus credentials"
+    - name: nexus-user-secret-key
       type: string
-      default: token
+      description: "Key within the Nexus Secret's data holding the username"
+    - name: nexus-token-secret-key
+      type: string
+      description: "Key within the Nexus Secret's data holding the token"
   workspaces:
     - name: source
   tasks:
@@ -109,36 +115,33 @@ spec:
           workspace: source
 
   finally:
-    # finally tasks always run after the tasks above, regardless of
-    # whether run-suite's own steps hit a non-zero exit — that's why
-    # run-pytest above swallows pytest's exit code with `|| true`: the
-    # actual pass/fail gate is check-results, not run-suite. A failing
-    # finally task still fails the overall PipelineRun, so the gate is
-    # preserved.
-    #
-    # NOTE: finally tasks run independently of each other (no implicit
-    # ordering between check-results and publish-results below). That's
-    # intentional here — publish-results only reads report files that
-    # check-results doesn't touch — but if that ever changes, add an
-    # explicit runAfter inside this finally block.
-    - name: check-results
-      taskRef:
-        name: check-results
-      workspaces:
-        - name: source
-          workspace: source
-    - name: publish-results
-      taskRef:
-        name: publish-results
-      params:
-        - name: results-repo-url
-          value: $(params.results-repo-url)
-        - name: results-branch
-          value: $(params.results-branch)
-        - name: results-secret-name
-          value: $(params.results-secret-name)
-        - name: results-secret-key
-          value: $(params.results-secret-key)
-      workspaces:
-        - name: source
-          workspace: source
+      #
+      # NOTE: finally tasks run independently of each other (no implicit
+      # ordering between check-results and report-results below). That's
+      # intentional here — report-results only reads report files that
+      # check-results doesn't touch 
+      - name: check-results
+        taskRef:
+          name: check-results
+        workspaces:
+          - name: source
+            workspace: source
+      - name: report-results
+        taskRef:
+          name: report-results
+        params:
+          - name: nexus-base-url
+            value: $(params.nexus-base-url)
+          - name: nexus-project
+            value: $(params.nexus-project)
+          - name: nexus-secret-name
+            value: $(params.nexus-secret-name)
+          - name: nexus-user-secret-key
+            value: $(params.nexus-user-secret-key)
+          - name: nexus-token-secret-key
+            value: $(params.nexus-token-secret-key)
+          - name: run-id
+            value: $(context.pipelineRun.name)
+        workspaces:
+          - name: source
+            workspace: source
