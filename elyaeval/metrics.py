@@ -31,9 +31,7 @@ from deepeval.test_case import SingleTurnParams
 # --- rag_qa -----------------------------------------------------------
 # End-to-end RAG: generation quality (answer_relevancy, faithfulness) +
 # retriever quality (the three contextual metrics). All five read
-# retrieval_context, which callers must populate themselves at test time —
-# see dataset.py docstring for why it is never pre-filled in the standard
-# dataset.
+# retrieval_context, which callers must populate themselves at test time
 RAG_METRICS = [
     AnswerRelevancyMetric(threshold=0.7),
     FaithfulnessMetric(threshold=0.7),

@@ -6,8 +6,7 @@ using the standard dataset + the matching metric preset.
 this repo into the shared elyaeval-rag-recipe Pipeline. The Pipeline/Task
 definitions themselves are NOT generated here — they're centralized and
 applied to the cluster independently (see recipes/tekton/ in the elyaeval
-repo). Only what's specific to this repo (repo URL, revision, where results
-get published) is rendered into the caller's repo.
+repo). Only what's specific to this repo (repo URL, revision) is rendered into the caller's repo.
 """
 
 import argparse
@@ -118,8 +117,7 @@ def init(
     if eval_mode == "component":
         print(
             "Note: generating in component mode — this suite calls your app's traced "
-            "entrypoint IN-PROCESS (no HTTP) and scores each @observe'd span "
-            "separately. It's meant to run alongside the e2e suite, not replace it — "
+            "entrypoint IN-PROCESS (no HTTP) and scores each @observe'd span separately"
             "see the comment at the top of the generated file."
         )
     elif corpus_mode == "existing" and task_type not in _TASK_TYPES_WITHOUT_CORPUS_MODE:
@@ -149,8 +147,7 @@ def init(
 def init_ci(
     repo_url: str,
     revision: str,
-    results_repo_url: str,
-    results_branch: str,
+    blob_container: str,
     output: str,
     task_type: str = "rag_qa",
     test_file: str = None,
@@ -165,8 +162,7 @@ def init_ci(
     rendered = _load_ci_template().format(
         repo_url=repo_url,
         revision=revision,
-        results_repo_url=results_repo_url,
-        results_branch=results_branch,
+        blob_container=blob_container,
         elyaeval_version=elyaeval_version,
         test_file=test_file,
     )
@@ -245,16 +241,6 @@ def main():
         help="Branch/tag/commit of --repo-url to run the suite against. Default: main.",
     )
     p_init_ci.add_argument(
-        "--results-repo-url",
-        default=None,
-        help="HTTPS repo URL to publish CI results into. Default: same as --repo-url.",
-    )
-    p_init_ci.add_argument(
-        "--results-branch",
-        default="ci-results",
-        help="Branch of --results-repo-url that CI result artifacts get committed onto. Default: ci-results.",
-    )
-    p_init_ci.add_argument(
         "--task-type",
         default="rag_qa",
         help=(
@@ -262,6 +248,15 @@ def main():
             "Only used to derive the default --test-file value (test_elyaeval_<task_type>.py) "
             "— has no effect if --test-file is passed explicitly. Default: rag_qa, since "
             "that's the only task type currently wired into the shared recipe."
+        ),
+    )
+    p_init_ci.add_argument(
+        "--blob-container",
+        required=True,
+        help=(
+            "Azure Blob Storage container this repo's run results get uploaded into "
+            "(report-results Task's blob-container param), e.g. results. Must already "
+            "exist in the target Storage Account (or Azurite, for local runs)."
         ),
     )
     p_init_ci.add_argument(
@@ -305,25 +300,25 @@ def main():
             print(f"  2. Run: deepeval test run {out_path}")
 
     elif args.command == "init-ci":
-        results_repo_url = args.results_repo_url or args.repo_url
-        test_file = args.test_file or _default_test_filename(args.task_type)
-        out_path = init_ci(
-            repo_url=args.repo_url,
-            revision=args.revision,
-            results_repo_url=results_repo_url,
-            results_branch=args.results_branch,
-            output=args.output,
-            task_type=args.task_type,
-            test_file=args.test_file,
-        )
-        print(f"Wrote {out_path}")
-        print("Next steps:")
-        print("  1. Confirm the elyaeval-rag-recipe Pipeline/Task set is applied to your target cluster")
-        print("     (from the elyaeval repo's recipes/tekton/ — this file does not generate those).")
-        print(f"  2. Confirm {test_file} exists in this repo at the path set for test-file in {out_path}")
-        print(f"     (it must match whatever `elyaeval init` actually wrote — rename either side if not).")
-        print(f"  3. Commit {out_path} to this repo.")
-        print("  4. Set $SUT_URL / $JUDGE_MODEL_NAME / $JUDGE_BASE_URL and apply — see comments in the file.")
+            test_file = args.test_file or _default_test_filename(args.task_type)
+            out_path = init_ci(
+                repo_url=args.repo_url,
+                revision=args.revision,
+                blob_container=args.blob_container,
+                output=args.output,
+                task_type=args.task_type,
+                test_file=args.test_file,
+            )
+            print(f"Wrote {out_path}")
+            print("Next steps:")
+            print("  1. Confirm the elyaeval-rag-recipe Pipeline/Task set is applied to your target cluster")
+            print("     (from the elyaeval repo's recipes/tekton/ — this file does not generate those).")
+            print(f"  2. Confirm {test_file} exists in this repo at the path set for test-file in {out_path}")
+            print(f"     (it must match whatever `elyaeval init` actually wrote — rename either side if not).")
+            print("  3. Confirm the blob-storage-credentials Secret exists in the target namespace")
+            print("     (shared across projects — see recipes/tekton/README for how to create it).")
+            print(f"  4. Commit {out_path} to this repo.")
+            print("  5. Set $SUT_URL / $JUDGE_MODEL_NAME / $JUDGE_BASE_URL and apply — see comments in the file.")
 
 
 if __name__ == "__main__":

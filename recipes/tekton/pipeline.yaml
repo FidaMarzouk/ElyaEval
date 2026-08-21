@@ -71,26 +71,19 @@ spec:
     - name: judge-api-key-secret-key
       type: string
       default: api-key
-    - name: nexus-base-url
+    - name: blob-container
       type: string
-      default: "http://host.docker.internal:8081/repository/eval-results"
+      description: "Container name for this SUT/project, e.g. project-x — one per SUT/team for access isolation"
+    - name: blob-connection-string-secret-name
+      type: string
+      default: blob-storage-credentials
       description: >-
-        Base URL of the Nexus raw hosted repo. Like elyaeval-package-spec
-        above, this is a legitimate shared default — one Nexus instance
-        serves every project — override only for a different Nexus
-        environment.
-    - name: nexus-project
+        Name of the Secret holding the Azure Storage connection string.
+        Same Secret mechanism/shape works for Azurite (local dev) and a
+        real Storage Account — only the Secret's *contents* change.
+    - name: blob-connection-string-secret-key
       type: string
-      description: "Subfolder / project namespace under the raw repo, e.g. project-x — one per SUT/team for access isolation"
-    - name: nexus-secret-name
-      type: string
-      default: nexus-credentials
-    - name: nexus-user-secret-key
-      type: string
-      default: username
-    - name: nexus-token-secret-key
-      type: string
-      default: token
+      default: connection-string
   workspaces:
     - name: source
   tasks:
@@ -158,16 +151,12 @@ spec:
         taskRef:
           name: report-results
         params:
-          - name: nexus-base-url
-            value: $(params.nexus-base-url)
-          - name: nexus-project
-            value: $(params.nexus-project)
-          - name: nexus-secret-name
-            value: $(params.nexus-secret-name)
-          - name: nexus-user-secret-key
-            value: $(params.nexus-user-secret-key)
-          - name: nexus-token-secret-key
-            value: $(params.nexus-token-secret-key)
+          - name: blob-container
+            value: $(params.blob-container)
+          - name: blob-connection-string-secret-name
+            value: $(params.blob-connection-string-secret-name)
+          - name: blob-connection-string-secret-key
+            value: $(params.blob-connection-string-secret-key)
           - name: run-id
             value: $(context.pipelineRun.name)
         workspaces:

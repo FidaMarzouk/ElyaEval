@@ -270,9 +270,11 @@ spec:
       
 
 ---
-# report-results: uploads the run's CSV report to Nexus's raw hosted repository.
-# One upload per run, under a unique run-id filename. 
-# "Current state" is just whichever file is newest
+# report-results: uploads the run's CSV report to an Azure Blob Storage
+# container (Azurite locally, a real Storage Account in higher envs — the
+# az CLI and connection-string mechanism are identical either way).
+# One upload per run, under a unique run-id filename.
+# "Current state" is just whichever blob is newest.
 
 apiVersion: tekton.dev/v1
 kind: Task
@@ -280,65 +282,66 @@ metadata:
   name: report-results
 spec:
   params:
-    - name: nexus-base-url
+    - name: blob-container
       type: string
-      description: "Base URL of the Nexus raw hosted repo, e.g. https://nexus.elyadata.internal/repository/eval-results"
-    - name: nexus-project
+      description: "Container name to upload results into, e.g. project-x"
+    - name: blob-connection-string-secret-name
       type: string
-      description: "Subfolder / project namespace under the raw repo, e.g. project-x"
-    - name: nexus-secret-name
+      description: Name of the Secret holding the Azure Storage connection string
+      # no default — pipeline.yaml owns it (default: blob-storage-credentials)
+    - name: blob-connection-string-secret-key
       type: string
-      description: Name of the Secret holding Nexus upload credentials
-      # no default — pipeline.yaml owns it (default: nexus-credentials)
-    - name: nexus-user-secret-key
-      type: string
-      description: Key within that Secret holding the Nexus username
-    - name: nexus-token-secret-key
-      type: string
-      description: Key within that Secret holding the Nexus token/password
+      description: Key within that Secret holding the connection string
     - name: run-id
       type: string
-      description: "Unique identifier for this run, used as the uploaded filename"
+      description: "Unique identifier for this run, used as the uploaded blob name"
   workspaces:
     - name: source
   steps:
     - name: upload-report
-      image: curlimages/curl:8.9.1
+      image: mcr.microsoft.com/azure-cli:2.65.0
       env:
-        - name: NEXUS_USER
+        # az storage blob upload picks this up automatically — no --connection-string
+        # flag needed. Works unchanged against Azurite (dev) or a real Storage
+        # Account (prod): only the connection string's contents change.
+        - name: AZURE_STORAGE_CONNECTION_STRING
           valueFrom:
             secretKeyRef:
-              name: $(params.nexus-secret-name)
-              key: $(params.nexus-user-secret-key)
-        - name: NEXUS_TOKEN
-          valueFrom:
-            secretKeyRef:
-              name: $(params.nexus-secret-name)
-              key: $(params.nexus-token-secret-key)
+              name: $(params.blob-connection-string-secret-name)
+              key: $(params.blob-connection-string-secret-key)
       script: |
         #!/bin/sh
         set -eu
 
         RUN_ID="$(params.run-id)"
-        BASE="$(params.nexus-base-url)/$(params.nexus-project)"
 
-        # Don't assume the task type: report.py names the CSV
         # results_<task_type>.csv, and this Task runs for every task type
         # (rag_qa, retrieval, summarization, qa_correctness, ...), so the
         # filename varies per run-suite invocation. Pick up whatever
         # results_*.csv actually landed in report/ instead of hardcoding
         # one task type's name.
+        #
+        # A single run-suite invocation can also legitimately produce MORE
+        # than one CSV — e.g. elyaeval/DeepEval writes a separate
+        # results_<task_type>_component.csv alongside results_<task_type>.csv
+        # for metrics that decompose into component sub-scores. So this
+        # uploads every results_*.csv found, one blob each, instead of
+        # refusing when there's more than one. The filename's suffix (the
+        # part after "results_") disambiguates the blob name.
         CSV_COUNT=$(find "$(workspaces.source.path)/report" -maxdepth 1 -name 'results_*.csv' 2>/dev/null | wc -l)
 
         if [ "$CSV_COUNT" -eq 0 ]; then
           echo "No results_*.csv found under $(workspaces.source.path)/report — skipping upload"
-        elif [ "$CSV_COUNT" -gt 1 ]; then
-          echo "Found $CSV_COUNT results_*.csv files — expected exactly one per run, refusing to guess which to upload:" >&2
-          find "$(workspaces.source.path)/report" -maxdepth 1 -name 'results_*.csv' >&2
-          exit 1
         else
-          CSV=$(find "$(workspaces.source.path)/report" -maxdepth 1 -name 'results_*.csv')
-          curl -u "${NEXUS_USER}:${NEXUS_TOKEN}" --fail \
-            --upload-file "$CSV" "$BASE/$RUN_ID.csv"
-          echo "✓ Uploaded $CSV to $BASE/$RUN_ID.csv"
+          find "$(workspaces.source.path)/report" -maxdepth 1 -name 'results_*.csv' | while IFS= read -r CSV; do
+            BASENAME=$(basename "$CSV" .csv)
+            SUFFIX=${BASENAME#results_}
+            BLOB_NAME="${RUN_ID}_${SUFFIX}.csv"
+            az storage blob upload \
+              --container-name "$(params.blob-container)" \
+              --file "$CSV" \
+              --name "$BLOB_NAME" \
+              --overwrite
+            echo "✓ Uploaded $CSV to container $(params.blob-container) as $BLOB_NAME"
+          done
         fi

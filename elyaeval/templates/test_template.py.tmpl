@@ -44,11 +44,11 @@ from pathlib import Path
 from deepeval.test_case import LLMTestCase
 import pytest
 
-from elyaeval import load_standard_dataset, evaluate_golden
+from elyaeval import load_standard_dataset, evaluate_golden, new_report_path
 from elyaeval.metrics import {metrics_constant}
 from elyaeval.run_contracts import RAGRunResult
 
-REPORT_CSV = Path("report/results_{task_type}.csv")
+REPORT_CSV = new_report_path("{task_type}")
 
 # TODO 1: import your app under test, e.g.:
 # from myapp.pipeline import answer_question
@@ -94,15 +94,21 @@ def run_app(user_input: str) -> RAGRunResult:
     raise NotImplementedError("Wire this up to your app before running the suite.")
 
 
+# Your goldens file must match the schema in elyaeval/dataset.py's
+# GOLDEN_SCHEMA (also documented in the main README's "Goldens file
+# schema" section) — load_standard_dataset() validates the whole file
+# upfront and raises GoldenValidationError listing every problem found
+# before generating any test cases.
 GOLDENS = load_standard_dataset(task_type="{task_type}", ci_stage="{ci_stage}")
 
 
 @pytest.mark.parametrize(
-    "golden",
-    GOLDENS,
+    "indexed_golden",
+    list(enumerate(GOLDENS)),
     ids=[g.additional_metadata.get("priority", "") + "_" + str(i) for i, g in enumerate(GOLDENS)],
 )
-def test_{task_type}(golden):
+def test_{task_type}(indexed_golden):
+    index, golden = indexed_golden
     run_result = run_app(golden.input)
 
     test_case = LLMTestCase(
@@ -115,6 +121,10 @@ def test_{task_type}(golden):
 
     # One evaluate() call per golden (test_cases=[test_case], never the
     # whole GOLDENS list) — keeps scoring per-golden and gives each a
-    # clean row (or rows, one per metric) in REPORT_CSV.
-    result = evaluate_golden(golden, test_case, {metrics_constant}, csv_path=REPORT_CSV)
+    # clean row (or rows, one per metric) in REPORT_CSV. fallback_index=index
+    # is what makes golden_id unique per row (e.g. "p1_0" vs "p1_1") instead
+    # of every golden sharing the same priority-only id.
+    result = evaluate_golden(
+        golden, test_case, {metrics_constant}, csv_path=REPORT_CSV, fallback_index=index
+    )
     assert result.success, f"{{result.name}} failed — see {{REPORT_CSV}} for per-metric scores"

@@ -16,9 +16,11 @@ name/score/threshold/success/reason) instead of a raised AssertionError.
 That structured result is what gets written to CSV — one row per
 (golden, metric) pair — and is also what the caller asserts on for the
 pytest pass/fail gate, so junit.xml keeps working unchanged in the meantime.
+
 """
 
 import csv
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Optional
 
@@ -40,6 +42,19 @@ CSV_FIELDS = [
     "reason",
     "error",
 ]
+
+
+def new_report_path(task_type: str, report_dir: str | Path = "report") -> Path:
+    """Build a fresh, timestamped CSV path: report/results_<task_type>_<UTC
+    timestamp>.csv. Call this ONCE, at module level in a generated test file
+    (so it's evaluated once per pytest session, not once per golden) — every
+    golden tested in that session then appends to the same file via
+    append_csv_rows(), while the next session gets its own new filename
+    automatically. Nothing to delete, nothing to clean up between runs."""
+    report_dir = Path(report_dir)
+    report_dir.mkdir(parents=True, exist_ok=True)
+    timestamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+    return report_dir / f"results_{task_type}_{timestamp}.csv"
 
 
 def _golden_id(golden: Golden, fallback_index: Optional[int] = None) -> str:
