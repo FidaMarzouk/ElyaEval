@@ -15,6 +15,7 @@ from importlib.metadata import version as _pkg_version
 from pathlib import Path
 
 from elyaeval.dataset import load_standard_dataset
+from elyaeval.html_report import print_metric_averages, read_csv_rows, render_html_report
 
 _TASK_TYPE_TO_METRICS_CONSTANT = {
     "rag_qa": "RAG_METRICS",
@@ -175,6 +176,35 @@ def init_ci(
     return out_path
 
 
+def report(csv_path: str, html_path: str = None, group_by: str = "metric_name") -> Path:
+    """
+    `elyaeval report --csv <path>` — regenerate the HTML report + print
+    per-metric averages for a CSV that already exists on disk, without
+    re-running any tests. Meant for two cases the pytest-plugin path
+    (elyaeval/plugin.py, runs automatically at session end) doesn't cover:
+
+      - a CSV produced by an older elyaeval version, before HTML reports
+        existed (e.g. one already sitting in blob storage from a past run)
+      - regenerating on demand after downloading a CSV from CI locally
+
+    --group-by defaults to "metric_name" (matches report.py's flat CSVs).
+    Pass --group-by span_name,metric_name for a *_component.csv produced
+    by tracing_report.py, so metrics repeated across spans get their own
+    row instead of being averaged together.
+    """
+    src = Path(csv_path)
+    if not src.exists():
+        raise SystemExit(f"{src} does not exist.")
+
+    keys = tuple(k.strip() for k in group_by.split(",") if k.strip())
+    out_path = render_html_report(src, html_path=html_path, group_keys=keys)
+    print(f"Wrote {out_path}")
+
+    rows = read_csv_rows(src)
+    print_metric_averages(rows, group_keys=keys)
+    return out_path
+
+
 def main():
     parser = argparse.ArgumentParser(prog="elyaeval")
     sub = parser.add_subparsers(dest="command", required=True)
@@ -274,6 +304,26 @@ def main():
         help="Path to write the generated PipelineRun. Default: pipelinerun.yaml",
     )
 
+    p_report = sub.add_parser(
+        "report",
+        help="Regenerate the HTML report + per-metric averages for an existing results CSV",
+    )
+    p_report.add_argument("--csv", required=True, help="Path to a results_*.csv file (e2e or component).")
+    p_report.add_argument(
+        "--html",
+        default=None,
+        help="Output HTML path. Default: same name as --csv with a .html extension.",
+    )
+    p_report.add_argument(
+        "--group-by",
+        default="metric_name",
+        help=(
+            "Comma-separated columns to average by. Default: metric_name "
+            "(matches results_<task_type>_<ts>.csv from report.py). Use "
+            "span_name,metric_name for a *_component.csv from tracing_report.py."
+        ),
+    )
+
     args = parser.parse_args()
 
     if args.command == "init":
@@ -319,6 +369,9 @@ def main():
             print("     (shared across projects — see recipes/tekton/README for how to create it).")
             print(f"  4. Commit {out_path} to this repo.")
             print("  5. Set $SUT_URL / $JUDGE_MODEL_NAME / $JUDGE_BASE_URL and apply — see comments in the file.")
+
+    elif args.command == "report":
+        report(args.csv, html_path=args.html, group_by=args.group_by)
 
 
 if __name__ == "__main__":

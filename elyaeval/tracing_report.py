@@ -44,6 +44,8 @@ from deepeval.evaluate.configs import AsyncConfig, CacheConfig, DisplayConfig, E
 from deepeval.evaluate.types import EvaluationResult, TestResult
 from deepeval.metrics import BaseMetric
 
+from .html_report import register_report
+
 TRACED_CSV_FIELDS = [
     "golden_id",
     "priority",
@@ -78,7 +80,13 @@ def append_traced_csv_rows(csv_path: str | Path, rows: list[dict]) -> None:
     report.append_csv_rows, duplicated (not imported) because the two CSVs
     have different columns (span_name) and are meant to stay independent
     files/schemas — safe to call once per golden across a serial pytest
-    run, not safe under parallel workers (xdist) writing the same path."""
+    run, not safe under parallel workers (xdist) writing the same path.
+
+    Registers csv_path with group_keys=("span_name", "metric_name")
+    instead of report.py's ("metric_name",) — the same metric name can be
+    scored on more than one span here (e.g. Faithfulness on both a
+    "retrieve" and a "generate_answer" span), so averaging by metric name
+    alone would silently blend two different spans' scores together."""
     path = Path(csv_path)
     path.parent.mkdir(parents=True, exist_ok=True)
     write_header = not path.exists() or path.stat().st_size == 0
@@ -88,6 +96,8 @@ def append_traced_csv_rows(csv_path: str | Path, rows: list[dict]) -> None:
         if write_header:
             writer.writeheader()
         writer.writerows(rows)
+
+    register_report(path, group_keys=("span_name", "metric_name"))
 
 
 def traced_test_result_to_csv_rows(golden_id: str, priority: str, test_result: TestResult) -> list[dict]:

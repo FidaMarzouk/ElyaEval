@@ -138,15 +138,75 @@ so pass/fail and per-metric scores stay traceable to a single golden.
 
 ## Reading the results
 
-Two outputs, both written per golden as the suite runs (not just at the end):
-- **`junit.xml`** — plain pass/fail, what CI gates on.
-- **`report/results_<task_type>[_component].csv`** — one row per `(golden, metric)` (plus
-  `span_name` for component mode): `golden_id, priority, input, metric_name, score, threshold,
-  success, reason, error`. Filter/sort this to find e.g. every Faithfulness failure without
-  reading raw pytest output.
+Three outputs, written per golden as the suite runs (not just at the end), plus one written once
+at the very end:
 
-Set `DEEPEVAL_RESULTS_FOLDER` to also get DeepEval's own structured JSON (score/reason/cost per
-metric per test case) — useful for cost-budget tracking later; not required to run the suite.
+- **`junit.xml`** — plain pass/fail, what CI gates on.
+- **`report/results_<task_type>_<UTC timestamp>[_component].csv`** — one row per `(golden, metric)`
+  (plus `span_name` for component mode): `golden_id, priority, input, metric_name, score, threshold,
+  success, reason, error`. Filter/sort this to find e.g. every Faithfulness failure without
+  reading raw pytest output. `new_report_path()` builds the filename once per session, so every run
+  gets its own timestamped file automatically — nothing to clean up between runs, and nothing from
+  an old run gets silently appended to or overwritten by a new one.
+- **`report/results_<task_type>_<UTC timestamp>[_component].html`** — same data as the CSV, rendered
+  as a self-contained HTML file (inline CSS, no CDN calls — opens standalone, including straight off
+  a blob-storage download). Two tables: a **per-metric summary** (average/min/max score, pass rate,
+  threshold, computed across every golden that ran) and the full **per-golden detail** table, with
+  pass/fail colored and a score bar per row. This is what answers "what did Faithfulness average
+  across the whole run, not just per input" — see [Per-metric averages](#per-metric-averages) below.
+  Written automatically at the end of the pytest session by elyaeval's own pytest plugin (auto-registered
+  via `pyproject.toml`'s `pytest11` entry point the moment `elyaeval` is installed) — no change needed
+  in any generated test file to get it.
+- **`DEEPEVAL_RESULTS_FOLDER`** (opt-in, set the env var) — DeepEval's own structured JSON
+  (score/reason/cost per metric per test case), useful for cost-budget tracking later; not required
+  to run the suite.
+
+The plugin also prints the same per-metric average table to the terminal right after pytest's own
+summary, so you see it locally without opening the CSV or HTML at all:
+
+```
+==================== elyaeval report ====================
+[elyaeval] report/results_rag_qa_20260825T130000Z.csv -> results_rag_qa_20260825T130000Z.html
+metric              avg     min     max        pass  n
+-------------------------------------------------------
+Faithfulness       0.74    0.55    0.92         1/2  2
+AnswerRelevancy    0.84    0.81    0.88         2/2  2
+```
+
+### Per-metric averages
+
+`elyaeval.metric_averages(rows)` (also importable as `from elyaeval import metric_averages`) groups
+CSV rows by `metric_name` (or pass `group_keys=("span_name", "metric_name")` for a component CSV, so
+the same metric scored on two different spans doesn't get blended into one number) and returns, per
+group: `n`, `n_scored`, `avg_score`, `min_score`, `max_score`, `pass_count`, `pass_total`,
+`pass_rate`, and `threshold` (only populated if every row in the group shares one). Rows with a
+blank score — a metric that errored rather than scored — are excluded from the average rather than
+counted as 0, but are still counted in `n`/`pass_total`.
+
+Use it directly if you want the numbers in code (e.g. to fail a build on a metric's *average*
+dropping below some bar, not just individual golden failures):
+
+```python
+from elyaeval import read_csv_rows, metric_averages
+
+rows = read_csv_rows("report/results_rag_qa_20260825T130000Z.csv")
+for summary in metric_averages(rows):
+    print(summary["metric_name"], summary["avg_score"], summary["pass_rate"])
+```
+
+### Regenerating a report from an existing CSV
+
+For a CSV from before this feature existed (e.g. one already sitting in blob storage), or to
+regenerate on demand after downloading one locally:
+
+```bash
+elyaeval report --csv report/results_rag_qa_20260825T130000Z.csv
+# component CSVs need span_name in the grouping:
+elyaeval report --csv report/results_rag_qa_component_20260825T130500Z.csv --group-by span_name,metric_name
+```
+
+Writes `<csv-stem>.html` next to the CSV (or pass `--html` for a different path) and prints the same
+averages table.
 
 ## CI/CD (Tekton)
 
@@ -159,3 +219,9 @@ elyaeval init-ci --repo-url https://github.com/you/your-sut.git --blob-container
 
 The Pipeline/Task definitions themselves are centralized, not generated per repo — see
 [`recipes/tekton/README.md`](recipes/tekton/README.md) for cluster setup, secrets, and how to apply them.
+
+`report-results` uploads every `results_*.csv` under `report/` as its own blob, named
+`<run-id>_<suffix>.csv` (suffix = the CSV filename minus its `results_` prefix, so the UTC timestamp
+from `new_report_path()` carries straight through into the blob name). It uploads each CSV's
+`results_*.html` sibling the same way, as `<run-id>_<suffix>.html`, if the HTML file exists —
+older runs with no HTML sibling are skipped silently, not treated as an error.

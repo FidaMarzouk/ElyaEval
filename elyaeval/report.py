@@ -31,6 +31,8 @@ from deepeval.test_case import LLMTestCase
 from deepeval.dataset import Golden
 from deepeval.metrics import BaseMetric
 
+from .html_report import register_report
+
 CSV_FIELDS = [
     "golden_id",
     "priority",
@@ -70,7 +72,13 @@ def _golden_id(golden: Golden, fallback_index: Optional[int] = None) -> str:
 def append_csv_rows(csv_path: str | Path, rows: list[dict]) -> None:
     """Append `rows` to csv_path, writing the header first if the file is
     new or empty. Safe to call once per golden across a serial pytest run —
-    not safe under parallel workers (xdist) writing the same path."""
+    not safe under parallel workers (xdist) writing the same path.
+
+    Also registers csv_path with the html_report module (group_keys=
+    ("metric_name",)) so elyaeval's pytest plugin knows to render an HTML
+    sibling + print per-metric averages for it at session end — this is
+    the only place that registration needs to happen for the e2e/flat CSV
+    shape, since every row this module ever writes goes through here."""
     path = Path(csv_path)
     path.parent.mkdir(parents=True, exist_ok=True)
     write_header = not path.exists() or path.stat().st_size == 0
@@ -80,6 +88,8 @@ def append_csv_rows(csv_path: str | Path, rows: list[dict]) -> None:
         if write_header:
             writer.writeheader()
         writer.writerows(rows)
+
+    register_report(path, group_keys=("metric_name",))
 
 
 def test_result_to_csv_rows(golden_id: str, priority: str, test_result: TestResult) -> list[dict]:

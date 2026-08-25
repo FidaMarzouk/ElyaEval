@@ -75,6 +75,17 @@ spec:
     - name: test-file
       value: {test_file}
 
+    # OPT-IN: only needed for component-level test-file values that import
+    # the SUT in-process (see run-suite's Task-level comment in tasks.yaml).
+    # Leave commented out / omit for e2e (HTTP-only) test-file values —
+    # run-suite's default (a Secret name that doesn't exist) is a no-op.
+    # If your component test's SUT code needs env vars (API keys, etc.):
+    #   kubectl create secret generic <your-sut>-env `
+    #     --from-literal=SOME_API_KEY=$env:SOME_API_KEY `
+    #     -n elyaeval --dry-run=client -o yaml | kubectl apply -f -
+    # - name: sut-env-secret-name
+    #   value: <your-sut>-env
+
     # Judge model — left as shell placeholders, see the comment block above
     # for what to set per provider. judge-api-key-secret-* stay fixed:
     # same Secret is reused across providers, only its contents change.
