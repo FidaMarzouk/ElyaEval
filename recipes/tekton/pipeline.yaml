@@ -22,6 +22,17 @@ spec:
     - name: sut-url
       type: string
       description: Base URL of the SUT's /query endpoint, reachable from inside the cluster
+    - name: sut-requirements-file
+      type: string
+      default: ""
+      description: >-
+        OPT-IN, empty by default. Path (relative to repo root) of a
+        requirements file to install alongside elyaeval/pytest/deepeval —
+        ONLY set this for component-level test files that import the SUT's
+        own modules directly instead of talking to it over HTTP. Leave
+        empty for e2e/HTTP-only PipelineRuns; setup-env stays SUT-agnostic
+        for them exactly as before. See setup-env's Task-level comment in
+        tasks.yaml.
     - name: test-file
       type: string
       default: test_elyaeval_rag_qa.py
@@ -71,6 +82,15 @@ spec:
     - name: judge-api-key-secret-key
       type: string
       default: api-key
+    - name: sut-env-secret-name
+      type: string
+      default: sut-env-unset
+      description: >-
+        OPT-IN, empty-in-spirit like sut-requirements-file above. Name of
+        a Secret whose keys are injected as env vars for the SUT's own
+        code (e.g. GROQ_API_KEY) — ONLY needed for component-level
+        PipelineRuns. Leave at the default for e2e/HTTP-only runs; see
+        run-suite's Task-level comment in tasks.yaml.
     - name: blob-container
       type: string
       description: "Container name for this SUT/project, e.g. project-x — one per SUT/team for access isolation"
@@ -106,6 +126,8 @@ spec:
       params:
         - name: elyaeval-package-spec
           value: $(params.elyaeval-package-spec)
+        - name: sut-requirements-file
+          value: $(params.sut-requirements-file)
       workspaces:
         - name: source
           workspace: source
@@ -131,6 +153,8 @@ spec:
           value: $(params.judge-api-key-secret-name)
         - name: judge-api-key-secret-key
           value: $(params.judge-api-key-secret-key)
+        - name: sut-env-secret-name
+          value: $(params.sut-env-secret-name)
       workspaces:
         - name: source
           workspace: source

@@ -49,6 +49,19 @@ spec:
         plain version pin). No default here — pipeline.yaml owns the one
         legitimate hardcoded default for this recipe; keeping it out of this
         Task means there's only one place to bump the framework version.
+    - name: sut-requirements-file
+      type: string
+      default: ""
+      description: >-
+        OPT-IN escape hatch, empty by default. Path (relative to the repo
+        root) of a requirements file to additionally install — ONLY needed
+        for component-level test files that import the SUT's own modules
+        directly (e.g. test_elyaeval_*_component.py reaching into
+        rag_core.py/retriever.py) instead of talking to the SUT over HTTP.
+        End-to-end (HTTP-only) PipelineRuns must leave this empty — setup-env
+        stays SUT-agnostic for them, exactly as before. Prefer a binary wheel
+        package (e.g. psycopg2-binary, not psycopg2) in that requirements
+        file so this step doesn't also need build tooling (gcc/libpq-dev).
   workspaces:
     - name: source
   steps:
@@ -73,6 +86,23 @@ spec:
           requests
 
         echo "✓ Dependencies installed to .python-packages"
+
+        # --- Opt-in SUT deps (component-level tests only) -----------------
+        # Only runs when a PipelineRun explicitly sets sut-requirements-file.
+        # Every existing HTTP-only PipelineRun leaves this empty and hits
+        # none of the code below — behavior for them is unchanged.
+        SUT_REQS="$(params.sut-requirements-file)"
+        if [ -n "$SUT_REQS" ]; then
+          REQ_PATH="$(workspaces.source.path)/repo/$SUT_REQS"
+          if [ ! -f "$REQ_PATH" ]; then
+            echo "sut-requirements-file set to '$SUT_REQS' but $REQ_PATH not found" >&2
+            exit 1
+          fi
+          pip install --no-cache-dir \
+            --target "$(workspaces.source.path)/.python-packages" \
+            -r "$REQ_PATH"
+          echo "✓ SUT requirements installed from $SUT_REQS"
+        fi
 
 ---
 # run-suite: the actual test entrypoint. sut-url, test-file, and the
@@ -103,7 +133,6 @@ spec:
 # anthropic/openai; for local/Ollama the Secret still needs to exist, but
 # Ollama doesn't validate the value, so a placeholder is fine there.
 #
-# No pip installs here — reuses packages cached by setup-env via PYTHONPATH.
 apiVersion: tekton.dev/v1
 kind: Task
 metadata:
@@ -160,12 +189,35 @@ spec:
       type: string
       description: Key within that Secret holding the judge model's API key
       # no default — pipeline.yaml owns it (default: api-key)
+    - name: sut-env-secret-name
+      type: string
+      default: sut-env-unset
+      description: >-
+        OPT-IN escape hatch, mirrors sut-requirements-file's philosophy in
+        setup-env. Name of a Secret whose keys get injected as env vars
+        into the SUT's OWN code (e.g. GROQ_API_KEY, OPENAI_API_KEY) —
+        ONLY needed for component-level test files that import the SUT
+        in-process and therefore construct the SUT's own API clients at
+        import/runtime. Left at its default (a Secret name that never
+        exists) for e2e/HTTP-only PipelineRuns — the envFrom/optional:true
+        below makes a missing Secret a silent no-op, not a pod failure.
+        Deliberately a whole-Secret passthrough (not a single named var)
+        so this Task never needs to know which env var names any given
+        SUT happens to require — new SUTs/providers need zero edits here.
   workspaces:
     - name: source
   steps:
     - name: run-pytest
       image: python:3.11-slim
       workingDir: $(workspaces.source.path)/repo
+      envFrom:
+        # Whole-Secret passthrough for SUT-side env vars — see param
+        # description above. optional:true means the default (a Secret
+        # name that doesn't exist) is a no-op, so e2e/HTTP-only
+        # PipelineRuns are completely unaffected.
+        - secretRef:
+            name: $(params.sut-env-secret-name)
+            optional: true
       env:
         # APP_URL: base URL of the SUT, passed through from params.sut-url.
         # Read via os.environ["APP_URL"] inside your own run_app()
@@ -233,8 +285,14 @@ spec:
         # check-results is what actually fails the PipelineRun.
         python -m pytest "$(params.test-file)" \
           --junitxml="$(workspaces.source.path)/report/junit.xml" \
-          -q || true
+          -s -q || true
         cp report/results_*.csv "$(workspaces.source.path)/report/" 2>/dev/null || true
+        # elyaeval's pytest plugin (auto-registered once elyaeval is installed,
+        # see pyproject.toml's [project.entry-points.pytest11]) writes an HTML
+        # sibling next to each results_*.csv at session end — same basename,
+        # .html extension. Copy those over the same way so report-results has
+        # something to upload alongside the CSV.
+        cp report/results_*.html "$(workspaces.source.path)/report/" 2>/dev/null || true
 
 ---
 # check-results: gate on the JUnit output — pass/fail only, which is all
@@ -324,10 +382,8 @@ spec:
         # A single run-suite invocation can also legitimately produce MORE
         # than one CSV — e.g. elyaeval/DeepEval writes a separate
         # results_<task_type>_component.csv alongside results_<task_type>.csv
-        # for metrics that decompose into component sub-scores. So this
-        # uploads every results_*.csv found, one blob each, instead of
-        # refusing when there's more than one. The filename's suffix (the
-        # part after "results_") disambiguates the blob name.
+        # So this uploads every results_*.csv found, one blob each.
+        
         CSV_COUNT=$(find "$(workspaces.source.path)/report" -maxdepth 1 -name 'results_*.csv' 2>/dev/null | wc -l)
 
         if [ "$CSV_COUNT" -eq 0 ]; then
@@ -343,5 +399,24 @@ spec:
               --name "$BLOB_NAME" \
               --overwrite
             echo "✓ Uploaded $CSV to container $(params.blob-container) as $BLOB_NAME"
+
+            # elyaeval's pytest plugin writes an HTML sibling next to every
+            # results_*.csv it wrote (same basename, .html instead of .csv)
+            # — see elyaeval/plugin.py + run-suite's cp step above. Upload
+            # it under the SAME blob-name convention as the CSV (just
+            # .html instead of .csv) so the two are always easy to pair up
+            # in the container by name. Older CSVs from before this
+            # feature existed simply have no HTML sibling — silently
+            # skipped, no upload attempted, no error.
+            HTML="$(dirname "$CSV")/${BASENAME}.html"
+            if [ -f "$HTML" ]; then
+              HTML_BLOB_NAME="${RUN_ID}_${SUFFIX}.html"
+              az storage blob upload \
+                --container-name "$(params.blob-container)" \
+                --file "$HTML" \
+                --name "$HTML_BLOB_NAME" \
+                --overwrite
+              echo "✓ Uploaded $HTML to container $(params.blob-container) as $HTML_BLOB_NAME"
+            fi
           done
         fi
