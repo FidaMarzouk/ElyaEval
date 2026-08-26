@@ -1,7 +1,7 @@
 from .dataset import load_standard_dataset
 from .fixtures import make_golden_context_fixture
 from .report import evaluate_golden, new_report_path
-from .html_report import metric_averages, read_csv_rows, render_html_report
+from .html_report import metric_averages, read_csv_rows, render_html_report, total_cost
 
 __all__ = [
     "load_standard_dataset",
@@ -11,6 +11,7 @@ __all__ = [
     "render_html_report",
     "metric_averages",
     "read_csv_rows",
+    "total_cost",
 ]
 
 # Note: metric presets (RAG_METRICS, etc.) are deliberately NOT re-exported

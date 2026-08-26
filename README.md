@@ -144,10 +144,10 @@ at the very end:
 - **`junit.xml`** — plain pass/fail, what CI gates on.
 - **`report/results_<task_type>_<UTC timestamp>[_component].csv`** — one row per `(golden, metric)`
   (plus `span_name` for component mode): `golden_id, priority, input, metric_name, score, threshold,
-  success, reason, error`. Filter/sort this to find e.g. every Faithfulness failure without
-  reading raw pytest output. `new_report_path()` builds the filename once per session, so every run
-  gets its own timestamped file automatically — nothing to clean up between runs, and nothing from
-  an old run gets silently appended to or overwritten by a new one.
+  success, reason, error, evaluation_model, evaluation_cost`. Filter/sort this to find e.g. every
+  Faithfulness failure without reading raw pytest output. `new_report_path()` builds the filename once
+  per session, so every run gets its own timestamped file automatically — nothing to clean up between
+  runs, and nothing from an old run gets silently appended to or overwritten by a new one.
 - **`report/results_<task_type>_<UTC timestamp>[_component].html`** — same data as the CSV, rendered
   as a self-contained HTML file (inline CSS, no CDN calls — opens standalone, including straight off
   a blob-storage download). Two tables: a **per-metric summary** (average/min/max score, pass rate,
@@ -179,7 +179,8 @@ AnswerRelevancy    0.84    0.81    0.88         2/2  2
 CSV rows by `metric_name` (or pass `group_keys=("span_name", "metric_name")` for a component CSV, so
 the same metric scored on two different spans doesn't get blended into one number) and returns, per
 group: `n`, `n_scored`, `avg_score`, `min_score`, `max_score`, `pass_count`, `pass_total`,
-`pass_rate`, and `threshold` (only populated if every row in the group shares one). Rows with a
+`pass_rate`, `threshold` (only populated if every row in the group shares one), `total_cost`,
+`cost_n`, and `evaluation_model` (see [Judge cost tracking](#judge-cost-tracking) below). Rows with a
 blank score — a metric that errored rather than scored — are excluded from the average rather than
 counted as 0, but are still counted in `n`/`pass_total`.
 
@@ -192,6 +193,29 @@ from elyaeval import read_csv_rows, metric_averages
 rows = read_csv_rows("report/results_rag_qa_20260825T130000Z.csv")
 for summary in metric_averages(rows):
     print(summary["metric_name"], summary["avg_score"], summary["pass_rate"])
+```
+
+### Judge cost tracking
+
+Every CSV/HTML row also carries `evaluation_model` and `evaluation_cost`, straight off DeepEval's own
+`MetricData` (the same numbers DeepEval sums into its own terminal output's `token cost: $X USD`
+line). `evaluation_cost` is a USD amount, not a raw token count — DeepEval only tracks per-token cost
+on the public API, and only for judge models it has pricing built in for (OpenAI, Anthropic, etc.). A
+local/custom judge with no pricing config leaves this blank, same as DeepEval's own terminal output
+shows `token cost: None` rather than `$0` — the HTML/CSV/terminal summary here all follow the same
+convention: **blank/`—` means "unknown," not "free."** Nothing to configure — this is populated
+automatically the moment you point `elyaeval init` at a judge model DeepEval has pricing for; a run
+under your current local judge just shows `—` everywhere cost would go, and the per-metric/per-run
+totals will start populating with no further changes the moment that switches.
+
+The per-metric summary table (HTML and terminal) shows a `total_cost` per metric group, and
+`elyaeval.total_cost(rows)` gives the single across-the-whole-run number (same `—`-if-unknown rule):
+
+```python
+from elyaeval import read_csv_rows, total_cost
+
+rows = read_csv_rows("report/results_rag_qa_20260825T130000Z.csv")
+print(total_cost(rows))  # None if every metric's judge is unpriced, else summed USD
 ```
 
 ### Regenerating a report from an existing CSV

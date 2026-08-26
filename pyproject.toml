@@ -1,6 +1,6 @@
 [project]
 name = "elyaeval"
-version = "0.2.0"
+version = "0.3.0"
 description = "Starter kit for DeepEval-based CI/CD testing: standard dataset, metric presets, and a pytest-file generator."
 requires-python = ">=3.10"
 dependencies = [
@@ -12,7 +12,8 @@ dependencies = [
 elyaeval = "elyaeval.cli:main"
 
 # Auto-registers elyaeval/plugin.py as a pytest plugin for any environment
-# that has this package installed . This is what makes HTML reports + per-metric averages
+# that has this package installed — no conftest.py wiring needed in the
+# consuming repo. This is what makes HTML reports + per-metric averages
 # appear automatically at the end of `pytest`/`deepeval test run`, for
 # every generated test file, just by bumping the elyaeval version pin.
 [project.entry-points.pytest11]

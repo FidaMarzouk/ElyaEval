@@ -50,10 +50,11 @@ def session_reports() -> dict[Path, tuple[str, ...]]:
 
 
 def read_csv_rows(csv_path: str | Path) -> list[dict]:
-    """Read a report CSV back into a list of dicts, coercing score/threshold
-    to float and success to bool where possible. Rows are returned in file
-    order (i.e. the order goldens actually ran in), which is also the order
-    the detail table renders in — no re-sorting happens later on."""
+    """Read a report CSV back into a list of dicts, coercing score/threshold/
+    evaluation_cost to float and success to bool where possible. Rows are
+    returned in file order (i.e. the order goldens actually ran in), which
+    is also the order the detail table renders in — no re-sorting happens
+    later on the (mistaken) assumption that CSV order is arbitrary."""
     path = Path(csv_path)
     if not path.exists():
         return []
@@ -63,6 +64,12 @@ def read_csv_rows(csv_path: str | Path) -> list[dict]:
         row["score"] = _to_float(row.get("score"))
         row["threshold"] = _to_float(row.get("threshold"))
         row["success"] = _to_bool(row.get("success"))
+        # Older CSVs written before cost tracking was added simply have no
+        # evaluation_cost/evaluation_model column at all — csv.DictReader
+        # then leaves them missing from the dict entirely rather than "",
+        # so .get(...) (not [...]) everywhere downstream, and this coerces
+        # a genuinely absent column the same way as a blank one: None.
+        row["evaluation_cost"] = _to_float(row.get("evaluation_cost"))
     return rows
 
 
@@ -106,6 +113,19 @@ def metric_averages(rows: list[dict], group_keys: tuple[str, ...] = ("metric_nam
                       is fixed per suite); None if goldens in this group
                       used different thresholds, so a caller can't silently
                       display one that isn't actually representative
+      - total_cost:   sum of evaluation_cost (USD) across every row in the
+                      group that had a cost value. None (not 0) if NO row
+                      in the group had a cost — distinguishes "this judge
+                      model has no known pricing, cost is unknown" from
+                      "this judge model is free" (0.0), the same way
+                      DeepEval's own terminal summary shows "token cost:
+                      None" rather than $0 for an unpriced/local model.
+      - cost_n:       how many rows actually contributed a cost value —
+                      lets a caller tell "$0.0031 from 4 metrics" apart
+                      from "$0.0031 from 1 metric, other 3 unpriced"
+      - evaluation_model: the judge model name, IF every row in the group
+                      shares the same one; "multiple" if they differ (e.g.
+                      you changed the judge mid-run); None if absent
 
     Rows with an `error` value are still counted in n and pass_count/n
     (success is already False for them from evaluate_golden), just
@@ -131,6 +151,8 @@ def metric_averages(rows: list[dict], group_keys: tuple[str, ...] = ("metric_nam
         scores = [r["score"] for r in group_rows if r.get("score") is not None]
         successes = [r["success"] for r in group_rows if r.get("success") is not None]
         thresholds = {r["threshold"] for r in group_rows if r.get("threshold") is not None}
+        costs = [r["evaluation_cost"] for r in group_rows if r.get("evaluation_cost") is not None]
+        models = {r["evaluation_model"] for r in group_rows if r.get("evaluation_model")}
 
         summary = dict(zip(group_keys, key))
         summary["n"] = len(group_rows)
@@ -142,8 +164,24 @@ def metric_averages(rows: list[dict], group_keys: tuple[str, ...] = ("metric_nam
         summary["pass_total"] = len(successes)
         summary["pass_rate"] = (summary["pass_count"] / summary["pass_total"]) if successes else None
         summary["threshold"] = thresholds.pop() if len(thresholds) == 1 else None
+        summary["total_cost"] = sum(costs) if costs else None
+        summary["cost_n"] = len(costs)
+        summary["evaluation_model"] = (
+            models.pop() if len(models) == 1 else ("multiple" if len(models) > 1 else None)
+        )
         summaries.append(summary)
     return summaries
+
+
+def total_cost(rows: list[dict]) -> Optional[float]:
+    """Sum of evaluation_cost (USD) across ALL rows, independent of
+    grouping — the single "what did this whole run cost the judge model"
+    number for the HTML header / terminal summary. None if no row in the
+    run has a cost value at all (e.g. a local/unpriced judge model, same
+    case DeepEval's own terminal summary shows as "token cost: None"
+    rather than $0), not conflating "unknown" with "free"."""
+    costs = [r.get("evaluation_cost") for r in rows if r.get("evaluation_cost") is not None]
+    return sum(costs) if costs else None
 
 
 _CSS = """
@@ -212,6 +250,20 @@ def _fmt_pct(value: Optional[float]) -> str:
     return "—" if value is None else f"{value * 100:.0f}%"
 
 
+def _fmt_cost(value: Optional[float]) -> str:
+    """USD cost values from LLM judges are often fractions of a cent, so a
+    flat 2-decimal format would show "$0.00" for almost everything that
+    isn't a large batch. Uses more precision for small-but-nonzero values,
+    2 decimals once the amount is large enough for that to be meaningful."""
+    if value is None:
+        return "—"
+    if value == 0:
+        return "$0.00"
+    if abs(value) < 0.01:
+        return f"${value:.6f}"
+    return f"${value:.4f}"
+
+
 def _score_bar(value: Optional[float], threshold: Optional[float]) -> str:
     if value is None:
         return "—"
@@ -236,12 +288,15 @@ def _summary_table(rows: list[dict], group_keys: tuple[str, ...]) -> str:
         "Max",
         "Pass rate",
         "Threshold",
+        "Judge model",
+        "Total cost",
     ]
     head_html = "".join(f"<th>{_esc(h)}</th>" for h in headers)
 
     body_rows = []
     for s in summaries:
         key_cells = "".join(f"<td>{_esc(s[k])}</td>" for k in group_keys)
+        cost_note = f" ({s['cost_n']}/{s['n']} priced)" if s["cost_n"] and s["cost_n"] < s["n"] else ""
         body_rows.append(
             "<tr>"
             f"{key_cells}"
@@ -252,6 +307,9 @@ def _summary_table(rows: list[dict], group_keys: tuple[str, ...]) -> str:
             f'<td class="num">{_fmt_pct(s["pass_rate"])} '
             f'<span class="reason">({s["pass_count"]}/{s["pass_total"]})</span></td>'
             f'<td class="num">{_fmt_score(s["threshold"])}</td>'
+            f'<td>{_esc(s["evaluation_model"] or "—")}</td>'
+            f'<td class="num">{_fmt_cost(s["total_cost"])}'
+            f'<span class="reason">{cost_note}</span></td>'
             "</tr>"
         )
 
@@ -272,6 +330,8 @@ def _detail_table(rows: list[dict], extra_columns: tuple[str, ...] = ()) -> str:
         "Score",
         "Threshold",
         "Result",
+        "Judge model",
+        "Cost",
         "Reason / error",
     ]
     head_html = "".join(f"<th>{_esc(h)}</th>" for h in headers)
@@ -297,6 +357,8 @@ def _detail_table(rows: list[dict], extra_columns: tuple[str, ...] = ()) -> str:
             f'<td class="num">{_fmt_score(r.get("score"))}</td>'
             f'<td class="num">{_fmt_score(r.get("threshold"))}</td>'
             f"<td>{result_html}</td>"
+            f'<td>{_esc(r.get("evaluation_model") or "—")}</td>'
+            f'<td class="num">{_fmt_cost(r.get("evaluation_cost"))}</td>'
             f'<td class="{reason_class}">{_esc(reason)}</td>'
             "</tr>"
         )
@@ -339,6 +401,7 @@ def render_html_report(
 
     extra_columns = tuple(k for k in group_keys if k != "metric_name")
     report_title = title or csv_path.stem
+    run_cost = total_cost(rows)
 
     doc = f"""<!DOCTYPE html>
 <html lang="en">
@@ -353,6 +416,7 @@ def render_html_report(
 <div class="meta">
   <span>Source: {_esc(csv_path.name)}</span>
   <span>Rows: {len(rows)}</span>
+  <span>Total judge cost: {_fmt_cost(run_cost)}</span>
 </div>
 <h2>Per-metric summary</h2>
 {_summary_table(rows, group_keys)}
@@ -384,13 +448,17 @@ def print_metric_averages(
         (len(" / ".join(str(s[k]) for k in group_keys)) for s in summaries), default=10
     )
     label_width = max(label_width, len("metric"))
-    write(f"{'metric':<{label_width}}  {'avg':>6}  {'min':>6}  {'max':>6}  {'pass':>10}  n")
-    write("-" * (label_width + 40))
+    write(
+        f"{'metric':<{label_width}}  {'avg':>6}  {'min':>6}  {'max':>6}  "
+        f"{'pass':>10}  {'cost':>10}  n"
+    )
+    write("-" * (label_width + 52))
     for s in summaries:
         label = " / ".join(str(s[k]) for k in group_keys)
         pass_str = f"{s['pass_count']}/{s['pass_total']}" if s["pass_total"] else "—"
         write(
             f"{label:<{label_width}}  {_fmt_score(s['avg_score']):>6}  "
             f"{_fmt_score(s['min_score']):>6}  {_fmt_score(s['max_score']):>6}  "
-            f"{pass_str:>10}  {s['n']}"
+            f"{pass_str:>10}  {_fmt_cost(s['total_cost']):>10}  {s['n']}"
         )
+    write(f"\nTotal judge cost for this run: {_fmt_cost(total_cost(rows))}")

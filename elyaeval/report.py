@@ -43,6 +43,8 @@ CSV_FIELDS = [
     "success",
     "reason",
     "error",
+    "evaluation_model",
+    "evaluation_cost",
 ]
 
 
@@ -95,7 +97,16 @@ def append_csv_rows(csv_path: str | Path, rows: list[dict]) -> None:
 def test_result_to_csv_rows(golden_id: str, priority: str, test_result: TestResult) -> list[dict]:
     """One row per metric in test_result.metrics_data — this is what makes
     the CSV queryable per-metric (e.g. filter to just Faithfulness failures)
-    instead of collapsing a golden's several metric scores into one line."""
+    instead of collapsing a golden's several metric scores into one line.
+
+    evaluation_model/evaluation_cost come straight off DeepEval's own
+    MetricData — the same evaluation_cost DeepEval sums into the "token
+    cost: $X USD" line in its own terminal output (test_run.py). It's a USD
+    amount, not a raw token count — DeepEval doesn't expose per-metric
+    token counts on the public API, only cost, and only when the judge
+    model has known per-token pricing built in (OpenAI/Anthropic/etc.) — a
+    local/custom judge with no pricing config leaves this None, same as it
+    shows "token cost: None" in DeepEval's terminal output rather than $0."""
     rows = []
     for md in test_result.metrics_data or []:
         rows.append({
@@ -108,6 +119,8 @@ def test_result_to_csv_rows(golden_id: str, priority: str, test_result: TestResu
             "success": md.success,
             "reason": md.reason,
             "error": md.error,
+            "evaluation_model": md.evaluation_model,
+            "evaluation_cost": md.evaluation_cost,
         })
     return rows
 

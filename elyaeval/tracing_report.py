@@ -57,6 +57,8 @@ TRACED_CSV_FIELDS = [
     "success",
     "reason",
     "error",
+    "evaluation_model",
+    "evaluation_cost",
 ]
 
 
@@ -102,7 +104,9 @@ def append_traced_csv_rows(csv_path: str | Path, rows: list[dict]) -> None:
 
 def traced_test_result_to_csv_rows(golden_id: str, priority: str, test_result: TestResult) -> list[dict]:
     """One row per metric in test_result.metrics_data, same convention as
-    report.test_result_to_csv_rows, plus span_name (test_result.name — the
+    report.test_result_to_csv_rows (including evaluation_model/
+    evaluation_cost — see that function's docstring for what DeepEval does
+    and doesn't expose there), plus span_name (test_result.name — the
     @observe'd function name for a span-level result). A result with no
     metrics_data (the trace-level result, here) simply produces no rows —
     nothing was scored, so there's nothing to write."""
@@ -119,6 +123,8 @@ def traced_test_result_to_csv_rows(golden_id: str, priority: str, test_result: T
             "success": md.success,
             "reason": md.reason,
             "error": md.error,
+            "evaluation_model": md.evaluation_model,
+            "evaluation_cost": md.evaluation_cost,
         })
     return rows
 
