@@ -421,3 +421,190 @@ spec:
             fi
           done
         fi
+
+---
+# check-regression: the ACROSS-RUNS gate — separate from check-results,
+# which only gates a single run's metrics against their fixed thresholds.
+# This gates a run's per-metric averages against a BASELINE from a
+# previous run, so a change that still clears every metric's threshold
+# but scores meaningfully worse than before still fails the pipeline.
+#
+# Self-gating by design, no separate "enable this feature" switch needed:
+# the baseline blob (baseline_<task-type>.csv, one per test-file "shape" —
+# see STABLE_NAME below) simply doesn't exist until something explicitly
+# promotes one via promote-baseline=true. Until then, every run just logs
+# "no baseline yet" and passes — existing PipelineRuns that don't set
+# promote-baseline are completely unaffected by adding this Task. Once a
+# baseline exists, every subsequent run compares against it automatically.
+#
+# THREE STEPS, DELIBERATELY SEQUENTIAL (not independent, unlike
+# check-results/report-results in the finally block) — download-baseline
+# must finish before compare can read it, and compare must PASS (exit 0)
+# before promote-baseline runs, since Tekton skips later steps in a Task
+# once an earlier one fails. That's what stops a regressed run from ever
+# overwriting the baseline it just failed against — no extra conditional
+# logic needed for that, it falls out of normal step-failure semantics.
+#
+# STABLE_NAME: baseline blob names strip BOTH the results_ prefix and the
+# trailing _<UTC timestamp> (format YYYYMMDDTHHMMSSZ, fixed-width, matches
+# new_report_path() in report.py) from the candidate CSV's filename, e.g.
+# results_rag_qa_component_20260828T083251Z.csv -> rag_qa_component. That's
+# the part that's stable run-to-run for the SAME test-file/task-type, which
+# is what makes "baseline_rag_qa_component.csv" a meaningful blob to keep
+# comparing against and overwriting, rather than a one-off per run like the
+# timestamped blobs report-results uploads.
+apiVersion: tekton.dev/v1
+kind: Task
+metadata:
+  name: check-regression
+spec:
+  params:
+    - name: blob-container
+      type: string
+      description: "Container name to read/write baseline blobs in — same container report-results uploads run blobs to."
+    - name: blob-connection-string-secret-name
+      type: string
+      description: Name of the Secret holding the Azure Storage connection string
+    - name: blob-connection-string-secret-key
+      type: string
+      description: Key within that Secret holding the connection string
+    - name: regression-tolerance
+      type: string
+      default: "0.02"
+      description: >-
+        Absolute avg-score drop (0..1 scale, same units as a metric's
+        score/threshold) that counts as a regression. Passed straight to
+        `elyaeval compare --tolerance`.
+    - name: promote-baseline
+      type: string
+      default: "false"
+      description: >-
+        "true" to overwrite baseline_<task-type>.csv with THIS run's CSV
+        once comparison passes (or when no baseline exists yet, to
+        bootstrap one) — "false" (default) leaves the existing baseline
+        untouched regardless of outcome. Set "true" deliberately for runs
+        you want to become the new known-good state (e.g. a main-branch
+        run), not for every PR run — otherwise a PR could silently move
+        the baseline other PRs compare against.
+  workspaces:
+    - name: source
+  steps:
+    - name: download-baseline
+      image: mcr.microsoft.com/azure-cli:2.65.0
+      env:
+        - name: AZURE_STORAGE_CONNECTION_STRING
+          valueFrom:
+            secretKeyRef:
+              name: $(params.blob-connection-string-secret-name)
+              key: $(params.blob-connection-string-secret-key)
+      script: |
+        #!/bin/sh
+        set -eu
+
+        for CSV in "$(workspaces.source.path)"/report/results_*.csv; do
+          [ -e "$CSV" ] || continue
+          BASENAME=$(basename "$CSV" .csv)
+          SUFFIX=${BASENAME#results_}
+          STABLE_NAME=$(echo "$SUFFIX" | sed -E 's/_[0-9]{8}T[0-9]{6}Z$//')
+          BASELINE_BLOB="baseline_${STABLE_NAME}.csv"
+          BASELINE_FILE="$(workspaces.source.path)/report/${BASELINE_BLOB}"
+
+          if az storage blob download \
+               --container-name "$(params.blob-container)" \
+               --name "$BASELINE_BLOB" \
+               --file "$BASELINE_FILE" \
+               --only-show-errors >/dev/null 2>&1; then
+            echo "✓ Downloaded $BASELINE_BLOB for comparison against $CSV"
+          else
+            echo "ℹ No baseline blob '$BASELINE_BLOB' yet — $STABLE_NAME will skip regression comparison this run"
+          fi
+        done
+
+    - name: compare
+      image: python:3.11-slim
+      env:
+        - name: PYTHONPATH
+          value: $(workspaces.source.path)/.python-packages
+      script: |
+        #!/bin/sh
+        set -eu
+
+        REGRESSED=0
+        for CSV in "$(workspaces.source.path)"/report/results_*.csv; do
+          [ -e "$CSV" ] || continue
+          python - "$CSV" "$(workspaces.source.path)/report" "$(params.regression-tolerance)" <<'PYEOF' || REGRESSED=1
+        import os
+        import re
+        import subprocess
+        import sys
+
+        csv_path, report_dir, tolerance = sys.argv[1], sys.argv[2], sys.argv[3]
+        basename = os.path.basename(csv_path)
+        stem = basename[:-4] if basename.endswith(".csv") else basename
+        suffix = stem[len("results_"):] if stem.startswith("results_") else stem
+        stable = re.sub(r"_\d{8}T\d{6}Z$", "", suffix)
+
+        baseline_path = os.path.join(report_dir, f"baseline_{stable}.csv")
+        if not os.path.exists(baseline_path):
+            print(f"ℹ No baseline for {stable} — skipping regression check")
+            sys.exit(0)
+
+        # component CSVs have a span_name column the e2e ones don't —
+        # group by span_name+metric_name for those so the same metric name
+        # scored on two different spans isn't blended into one comparison.
+        group_by = "span_name,metric_name" if "component" in stable else "metric_name"
+        html_path = os.path.join(report_dir, f"regression_{stable}.html")
+
+        result = subprocess.run([
+            "elyaeval", "compare",
+            "--baseline", baseline_path,
+            "--candidate", csv_path,
+            "--tolerance", tolerance,
+            "--group-by", group_by,
+            "--html", html_path,
+        ])
+        sys.exit(result.returncode)
+        PYEOF
+        done
+
+        if [ "$REGRESSED" -eq 1 ]; then
+          echo "✗ Regression detected against baseline — failing this Task"
+          exit 1
+        fi
+        echo "✓ No regressions against baseline (or no baseline existed yet to compare against)"
+
+    - name: promote-baseline
+      image: mcr.microsoft.com/azure-cli:2.65.0
+      env:
+        - name: AZURE_STORAGE_CONNECTION_STRING
+          valueFrom:
+            secretKeyRef:
+              name: $(params.blob-connection-string-secret-name)
+              key: $(params.blob-connection-string-secret-key)
+      script: |
+        #!/bin/sh
+        set -eu
+
+        # This step only ever runs if `compare` above exited 0 — Tekton
+        # skips remaining steps in a Task once one fails, so a regressed
+        # run never reaches here regardless of this param's value.
+        if [ "$(params.promote-baseline)" != "true" ]; then
+          echo "promote-baseline is not 'true' — leaving existing baseline(s) unchanged"
+          exit 0
+        fi
+
+        for CSV in "$(workspaces.source.path)"/report/results_*.csv; do
+          [ -e "$CSV" ] || continue
+          BASENAME=$(basename "$CSV" .csv)
+          SUFFIX=${BASENAME#results_}
+          STABLE_NAME=$(echo "$SUFFIX" | sed -E 's/_[0-9]{8}T[0-9]{6}Z$//')
+          BASELINE_BLOB="baseline_${STABLE_NAME}.csv"
+
+          az storage blob upload \
+            --container-name "$(params.blob-container)" \
+            --file "$CSV" \
+            --name "$BASELINE_BLOB" \
+            --overwrite \
+            --only-show-errors
+          echo "✓ Promoted $CSV to baseline as $BASELINE_BLOB"
+        done

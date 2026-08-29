@@ -1,7 +1,15 @@
 from .dataset import load_standard_dataset
 from .fixtures import make_golden_context_fixture
 from .report import evaluate_golden, new_report_path
-from .html_report import metric_averages, read_csv_rows, render_html_report, total_cost
+from .html_report import (
+    compare_runs,
+    metric_averages,
+    read_csv_rows,
+    render_comparison_html,
+    render_html_report,
+    total_cost,
+)
+from .hyperparameters import log_run_metadata, read_run_metadata
 
 __all__ = [
     "load_standard_dataset",
@@ -12,6 +20,10 @@ __all__ = [
     "metric_averages",
     "read_csv_rows",
     "total_cost",
+    "log_run_metadata",
+    "read_run_metadata",
+    "compare_runs",
+    "render_comparison_html",
 ]
 
 # Note: metric presets (RAG_METRICS, etc.) are deliberately NOT re-exported

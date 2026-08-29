@@ -462,3 +462,243 @@ def print_metric_averages(
             f"{pass_str:>10}  {_fmt_cost(s['total_cost']):>10}  {s['n']}"
         )
     write(f"\nTotal judge cost for this run: {_fmt_cost(total_cost(rows))}")
+
+
+# ---------------------------------------------------------------------------
+# Regression comparison — diffing two runs' metric_averages() against each
+# other. This is what actually answers "did this change regress anything,"
+# which DeepEval's log_hyperparameters() does NOT do by itself — it only
+# tags a run with metadata; the comparison itself is a Confident-AI-
+# dashboard feature there. Everything below works purely off elyaeval's own
+# CSVs (+ optional hyperparameters.py sidecar JSON), so it needs no
+# Confident AI account.
+# ---------------------------------------------------------------------------
+
+DEFAULT_REGRESSION_TOLERANCE = 0.02  # absolute avg_score drop that counts as a regression
+
+
+def compare_runs(
+    baseline_rows: list[dict],
+    candidate_rows: list[dict],
+    group_keys: tuple[str, ...] = ("metric_name",),
+    tolerance: float = DEFAULT_REGRESSION_TOLERANCE,
+) -> list[dict]:
+    """
+    Align baseline vs candidate metric_averages() by group_keys and compute,
+    per group that appears in EITHER run:
+
+      - baseline_avg / candidate_avg / delta (candidate - baseline; None if
+        either side is missing an avg — e.g. a metric that errored out
+        entirely on one side, or a metric only one of the two runs has)
+      - baseline_pass_rate / candidate_pass_rate / pass_rate_delta, same
+        None-if-missing rule
+      - regressed: True if the group exists in BOTH runs and
+        candidate_avg is more than `tolerance` below baseline_avg. A group
+        that's brand new in candidate (not in baseline at all) or that
+        disappeared (was in baseline, not in candidate) is flagged
+        separately via `status`, not silently marked as regressed — a
+        metric that's simply new isn't a regression, and one that's gone
+        deserves its own callout (did the SUT drop a pipeline stage? did
+        the suite change?) rather than being invisible.
+      - status: "regressed" | "improved" | "unchanged" | "new" | "removed"
+        "improved"/"unchanged" split at the same `tolerance` band as
+        regression, so a +0.001 wobble isn't reported as "improved" any
+        more than a -0.001 wobble is reported as "regressed."
+
+    tolerance is an absolute score difference (both scores are 0..1), not a
+    percentage — default 0.02 matches a reasonable "noise floor" for an
+    LLM-judge metric re-run on unchanged inputs, but pass your own if a
+    metric's judge is noisier or stricter than that.
+    """
+    baseline_by_key = {tuple(s[k] for k in group_keys): s for s in metric_averages(baseline_rows, group_keys)}
+    candidate_by_key = {tuple(s[k] for k in group_keys): s for s in metric_averages(candidate_rows, group_keys)}
+
+    order: list[tuple] = []
+    for key in list(baseline_by_key) + list(candidate_by_key):
+        if key not in order:
+            order.append(key)
+
+    comparisons = []
+    for key in order:
+        b = baseline_by_key.get(key)
+        c = candidate_by_key.get(key)
+
+        b_avg = b["avg_score"] if b else None
+        c_avg = c["avg_score"] if c else None
+        b_pass = b["pass_rate"] if b else None
+        c_pass = c["pass_rate"] if c else None
+
+        if b is None:
+            status = "new"
+        elif c is None:
+            status = "removed"
+        elif b_avg is None or c_avg is None:
+            status = "unchanged"  # can't compare numerically; don't guess
+        else:
+            # Round before comparing to tolerance — plain float subtraction
+            # can put a value that's conceptually exactly AT the tolerance
+            # boundary a hair past it (e.g. 0.88 - 0.90 == -0.020000000000000018,
+            # not -0.02), which would otherwise flip an "unchanged" result
+            # to "regressed" purely from binary floating-point representation
+            # error, not a real score difference.
+            delta = round(c_avg - b_avg, 9)
+            if delta < -tolerance:
+                status = "regressed"
+            elif delta > tolerance:
+                status = "improved"
+            else:
+                status = "unchanged"
+
+        comparisons.append({
+            **dict(zip(group_keys, key)),
+            "status": status,
+            "baseline_avg": b_avg,
+            "candidate_avg": c_avg,
+            "delta": (c_avg - b_avg) if (b_avg is not None and c_avg is not None) else None,
+            "baseline_pass_rate": b_pass,
+            "candidate_pass_rate": c_pass,
+            "pass_rate_delta": (c_pass - b_pass) if (b_pass is not None and c_pass is not None) else None,
+            "baseline_cost": b["total_cost"] if b else None,
+            "candidate_cost": c["total_cost"] if c else None,
+        })
+    return comparisons
+
+
+def print_comparison(
+    comparisons: list[dict],
+    group_keys: tuple[str, ...] = ("metric_name",),
+    write=print,
+) -> None:
+    """Plain-text regression table — what `elyaeval compare` prints."""
+    if not comparisons:
+        write("No metrics in either run.")
+        return
+    label_width = max(
+        (len(" / ".join(str(c[k]) for k in group_keys)) for c in comparisons), default=10
+    )
+    label_width = max(label_width, len("metric"))
+    write(f"{'metric':<{label_width}}  {'baseline':>9}  {'candidate':>9}  {'delta':>8}  status")
+    write("-" * (label_width + 45))
+    for c in comparisons:
+        label = " / ".join(str(c[k]) for k in group_keys)
+        delta_str = "—" if c["delta"] is None else f"{c['delta']:+.3f}"
+        marker = {
+            "regressed": "▼ REGRESSED",
+            "improved": "▲ improved",
+            "unchanged": "= unchanged",
+            "new": "+ new",
+            "removed": "- removed",
+        }[c["status"]]
+        write(
+            f"{label:<{label_width}}  {_fmt_score(c['baseline_avg']):>9}  "
+            f"{_fmt_score(c['candidate_avg']):>9}  {delta_str:>8}  {marker}"
+        )
+    n_regressed = sum(1 for c in comparisons if c["status"] == "regressed")
+    if n_regressed:
+        write(f"\n{n_regressed} metric(s) regressed beyond tolerance.")
+    else:
+        write("\nNo regressions beyond tolerance.")
+
+
+def render_comparison_html(
+    comparisons: list[dict],
+    group_keys: tuple[str, ...] = ("metric_name",),
+    html_path: Optional[str | Path] = None,
+    title: str = "Regression comparison",
+    baseline_meta: Optional[dict] = None,
+    candidate_meta: Optional[dict] = None,
+) -> Optional[Path]:
+    """HTML version of print_comparison, with an optional hyperparameters
+    diff at the top (from hyperparameters.read_run_metadata() on each side)
+    so a reader sees WHAT changed between the two runs' SUT config, not
+    just that scores moved. Returns None (writes nothing) if no html_path
+    given — pass one explicitly, there's no CSV to infer a path from here
+    since this compares two of them."""
+    status_class = {
+        "regressed": "fail",
+        "improved": "pass",
+        "unchanged": "reason",
+        "new": "reason",
+        "removed": "error-cell",
+    }
+    status_label = {
+        "regressed": "▼ regressed",
+        "improved": "▲ improved",
+        "unchanged": "= unchanged",
+        "new": "+ new",
+        "removed": "− removed",
+    }
+
+    headers = [k.replace("_", " ").title() for k in group_keys] + [
+        "Baseline avg", "Candidate avg", "Delta", "Baseline pass", "Candidate pass", "Status",
+    ]
+    head_html = "".join(f"<th>{_esc(h)}</th>" for h in headers)
+    body_rows = []
+    for c in comparisons:
+        key_cells = "".join(f"<td>{_esc(c[k])}</td>" for k in group_keys)
+        delta_str = "—" if c["delta"] is None else f"{c['delta']:+.3f}"
+        body_rows.append(
+            "<tr>"
+            f"{key_cells}"
+            f'<td class="num">{_fmt_score(c["baseline_avg"])}</td>'
+            f'<td class="num">{_fmt_score(c["candidate_avg"])}</td>'
+            f'<td class="num">{delta_str}</td>'
+            f'<td class="num">{_fmt_pct(c["baseline_pass_rate"])}</td>'
+            f'<td class="num">{_fmt_pct(c["candidate_pass_rate"])}</td>'
+            f'<td class="{status_class[c["status"]]}">{status_label[c["status"]]}</td>'
+            "</tr>"
+        )
+    table_html = (
+        '<table class="detail-table">'
+        f"<thead><tr>{head_html}</tr></thead>"
+        f"<tbody>{''.join(body_rows)}</tbody>"
+        "</table>"
+    )
+
+    def _meta_block(label: str, meta: Optional[dict]) -> str:
+        hp = (meta or {}).get("hyperparameters") or {}
+        if not hp:
+            return f"<p><strong>{_esc(label)}:</strong> <em>no run metadata logged</em></p>"
+        items = "".join(f"<li><strong>{_esc(k)}:</strong> {_esc(v)}</li>" for k, v in hp.items())
+        return f"<p><strong>{_esc(label)}:</strong></p><ul>{items}</ul>"
+
+    meta_html = ""
+    if baseline_meta is not None or candidate_meta is not None:
+        meta_html = (
+            "<h2>Run configuration</h2>"
+            '<div style="display:flex; gap:2rem;">'
+            f'<div>{_meta_block("Baseline", baseline_meta)}</div>'
+            f'<div>{_meta_block("Candidate", candidate_meta)}</div>'
+            "</div>"
+        )
+
+    n_regressed = sum(1 for c in comparisons if c["status"] == "regressed")
+    verdict = (
+        f'<p style="color:var(--fail); font-weight:600;">{n_regressed} metric(s) regressed beyond tolerance.</p>'
+        if n_regressed
+        else '<p style="color:var(--pass); font-weight:600;">No regressions beyond tolerance.</p>'
+    )
+
+    doc = f"""<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>{_esc(title)}</title>
+<style>{_CSS}</style>
+</head>
+<body>
+<h1>{_esc(title)}</h1>
+{verdict}
+{meta_html}
+<h2>Per-metric comparison</h2>
+{table_html}
+</body>
+</html>
+"""
+    if html_path is None:
+        return None
+    out_path = Path(html_path)
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    out_path.write_text(doc, encoding="utf-8")
+    return out_path

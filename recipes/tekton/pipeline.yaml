@@ -104,6 +104,24 @@ spec:
     - name: blob-connection-string-secret-key
       type: string
       default: connection-string
+    - name: regression-tolerance
+      type: string
+      default: "0.02"
+      description: >-
+        Absolute avg-score drop that counts as a regression in the
+        check-regression finally task — see that Task's comment in
+        tasks.yaml for the full mechanism. Defaults match
+        elyaeval compare's own default, so an unset param behaves
+        identically to running `elyaeval compare` with no --tolerance.
+    - name: promote-baseline
+      type: string
+      default: "false"
+      description: >-
+        OPT-IN, "false" by default so no existing or new PipelineRun ever
+        moves the regression baseline just by running. Set "true" only for
+        runs you deliberately want to become the new known-good state
+        (e.g. a main-branch/nightly run) — see check-regression's
+        Task-level comment in tasks.yaml.
   workspaces:
     - name: source
   tasks:
@@ -161,10 +179,15 @@ spec:
 
   finally:
       #
-      # NOTE: finally tasks run independently of each other (no implicit
-      # ordering between check-results and report-results below). That's
-      # intentional here — report-results only reads report files that
-      # check-results doesn't touch 
+      # NOTE: check-results and report-results run independently of each
+      # other (no ordering between them) — report-results only reads
+      # report files that check-results doesn't touch. check-regression
+      # is DIFFERENT: it has its OWN internal step ordering (see its
+      # Task-level comment in tasks.yaml) but as a whole finally task it
+      # still runs independently of the other two here — it reads the
+      # same local report/ files check-results and report-results read,
+      # untouched by either of them, so there's nothing to sequence
+      # between finally tasks themselves.
       - name: check-results
         taskRef:
           name: check-results
@@ -183,6 +206,23 @@ spec:
             value: $(params.blob-connection-string-secret-key)
           - name: run-id
             value: $(context.pipelineRun.name)
+        workspaces:
+          - name: source
+            workspace: source
+      - name: check-regression
+        taskRef:
+          name: check-regression
+        params:
+          - name: blob-container
+            value: $(params.blob-container)
+          - name: blob-connection-string-secret-name
+            value: $(params.blob-connection-string-secret-name)
+          - name: blob-connection-string-secret-key
+            value: $(params.blob-connection-string-secret-key)
+          - name: regression-tolerance
+            value: $(params.regression-tolerance)
+          - name: promote-baseline
+            value: $(params.promote-baseline)
         workspaces:
           - name: source
             workspace: source

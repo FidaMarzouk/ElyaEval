@@ -15,7 +15,16 @@ from importlib.metadata import version as _pkg_version
 from pathlib import Path
 
 from elyaeval.dataset import load_standard_dataset
-from elyaeval.html_report import print_metric_averages, read_csv_rows, render_html_report
+from elyaeval.html_report import (
+    DEFAULT_REGRESSION_TOLERANCE,
+    compare_runs,
+    print_comparison,
+    print_metric_averages,
+    read_csv_rows,
+    render_comparison_html,
+    render_html_report,
+)
+from elyaeval.hyperparameters import read_run_metadata
 
 _TASK_TYPE_TO_METRICS_CONSTANT = {
     "rag_qa": "RAG_METRICS",
@@ -205,6 +214,72 @@ def report(csv_path: str, html_path: str = None, group_by: str = "metric_name") 
     return out_path
 
 
+def compare(
+    baseline_csv: str,
+    candidate_csv: str,
+    tolerance: float = DEFAULT_REGRESSION_TOLERANCE,
+    group_by: str = "metric_name",
+    html_path: str = None,
+) -> int:
+    """
+    `elyaeval compare --baseline <csv> --candidate <csv>` — diff two runs'
+    per-metric averages and flag regressions. This is the local,
+    Confident-AI-free answer to "did this model/prompt change regress
+    anything": point --baseline at your last known-good CSV (e.g. the one
+    from main, or from before a prompt change) and --candidate at the CSV
+    from the run you want to check.
+
+    If log_run_metadata() was called for either run (see
+    elyaeval.hyperparameters), the sidecar .meta.json's hyperparameters
+    are printed for both sides too, so you can see WHAT changed (model,
+    prompt version, ...) alongside the score deltas it produced — not
+    required, just picked up automatically if present.
+
+    Returns 0 if nothing regressed beyond `tolerance`, 1 if anything did —
+    meant to be used as this command's process exit code so a CI step can
+    gate on it directly, the same way check-results already gates on
+    JUnit.
+    """
+    baseline_path = Path(baseline_csv)
+    candidate_path = Path(candidate_csv)
+    if not baseline_path.exists():
+        raise SystemExit(f"{baseline_path} does not exist.")
+    if not candidate_path.exists():
+        raise SystemExit(f"{candidate_path} does not exist.")
+
+    keys = tuple(k.strip() for k in group_by.split(",") if k.strip())
+    baseline_rows = read_csv_rows(baseline_path)
+    candidate_rows = read_csv_rows(candidate_path)
+    comparisons = compare_runs(baseline_rows, candidate_rows, group_keys=keys, tolerance=tolerance)
+
+    baseline_meta = read_run_metadata(baseline_path)
+    candidate_meta = read_run_metadata(candidate_path)
+    for label, meta in (("Baseline", baseline_meta), ("Candidate", candidate_meta)):
+        hp = meta.get("hyperparameters")
+        if hp:
+            print(f"{label} config: " + ", ".join(f"{k}={v}" for k, v in hp.items()))
+    if baseline_meta or candidate_meta:
+        print()
+
+    print(f"Baseline:  {baseline_path}")
+    print(f"Candidate: {candidate_path}")
+    print(f"Tolerance: ±{tolerance}\n")
+    print_comparison(comparisons, group_keys=keys)
+
+    if html_path:
+        out = render_comparison_html(
+            comparisons,
+            group_keys=keys,
+            html_path=html_path,
+            title=f"{candidate_path.stem} vs {baseline_path.stem}",
+            baseline_meta=baseline_meta or None,
+            candidate_meta=candidate_meta or None,
+        )
+        print(f"\nWrote {out}")
+
+    return 1 if any(c["status"] == "regressed" for c in comparisons) else 0
+
+
 def main():
     parser = argparse.ArgumentParser(prog="elyaeval")
     sub = parser.add_subparsers(dest="command", required=True)
@@ -324,6 +399,32 @@ def main():
         ),
     )
 
+    p_compare = sub.add_parser(
+        "compare",
+        help="Diff two results CSVs' per-metric averages and flag regressions (no Confident AI needed)",
+    )
+    p_compare.add_argument("--baseline", required=True, help="Path to the known-good/previous results_*.csv.")
+    p_compare.add_argument("--candidate", required=True, help="Path to the results_*.csv being checked.")
+    p_compare.add_argument(
+        "--tolerance",
+        type=float,
+        default=DEFAULT_REGRESSION_TOLERANCE,
+        help=f"Absolute avg-score drop that counts as a regression. Default: {DEFAULT_REGRESSION_TOLERANCE}.",
+    )
+    p_compare.add_argument(
+        "--group-by",
+        default="metric_name",
+        help=(
+            "Comma-separated columns to average by. Default: metric_name. Use "
+            "span_name,metric_name for *_component.csv files."
+        ),
+    )
+    p_compare.add_argument(
+        "--html",
+        default=None,
+        help="Optional path to also write an HTML regression report.",
+    )
+
     args = parser.parse_args()
 
     if args.command == "init":
@@ -372,6 +473,16 @@ def main():
 
     elif args.command == "report":
         report(args.csv, html_path=args.html, group_by=args.group_by)
+
+    elif args.command == "compare":
+        exit_code = compare(
+            args.baseline,
+            args.candidate,
+            tolerance=args.tolerance,
+            group_by=args.group_by,
+            html_path=args.html,
+        )
+        raise SystemExit(exit_code)
 
 
 if __name__ == "__main__":
