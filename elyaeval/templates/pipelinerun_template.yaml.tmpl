@@ -58,6 +58,15 @@
 #   kubectl create secret generic blob-storage-credentials `
 #     --from-literal=connection-string=$env:AZURE_STORAGE_CONNECTION_STRING `
 #     -n elyaeval --dry-run=client -o yaml | kubectl apply -f -
+#
+# REGRESSION GATE (check-regression, see tasks.yaml): compares this run's
+# per-metric averages against a baseline_<task-type>.csv blob and fails the
+# PipelineRun if any metric dropped by more than regression-tolerance.
+# Self-gating: with no baseline blob yet, every run just skips this check
+# and passes — nothing to disable for a first run. Set promote-baseline to
+# "true" ONLY for runs you want to become the new known-good state (e.g. a
+# main-branch/nightly run); leave "false" for ordinary/PR runs so they
+# never move the baseline other runs compare against.
 apiVersion: tekton.dev/v1
 kind: PipelineRun
 metadata:
@@ -106,6 +115,13 @@ spec:
       value: blob-storage-credentials
     - name: blob-connection-string-secret-key
       value: connection-string
+
+    # OPT-IN regression gate — see the comment block above. Uncomment to
+    # override the defaults (tolerance 0.02, promote-baseline "false").
+    # - name: regression-tolerance
+    #   value: "0.02"
+    # - name: promote-baseline
+    #   value: "false"
   workspaces:
     - name: source
       volumeClaimTemplate:

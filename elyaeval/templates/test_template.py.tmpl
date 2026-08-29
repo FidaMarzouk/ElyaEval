@@ -31,12 +31,28 @@ throwaway CI corpus). That's a different, opt-in generator:
 WHAT YOU NEED TO FILL IN (search for TODO):
   1. Import your app's entrypoint function.
   2. Implement run_app() to call it and return a RAGRunResult.
+  3. (Optional, for regression testing) Fill in log_run_metadata() below
+     with whatever identifies THIS run's configuration.
 
 REPORT_CSV: each golden's per-metric scores (name/score/threshold/success/
 reason) are appended to this CSV as they run — one row per metric, so you
 can filter/sort by metric or golden afterward instead of reading raw
 pytest/junit output. Point it at wherever your CI workspace collects
 reports; it defaults to a local report/ dir for running the suite by hand.
+
+REGRESSION TESTING (across model/prompt changes): log_run_metadata() tags
+this run with whatever config produced it (generator model, prompt
+version, chunk size, ...) — purely local, no Confident AI account needed
+for plain string/int/float values. Later, compare any two runs with:
+
+    elyaeval compare --baseline report/results_..._<old>.csv \
+                      --candidate report/results_..._<new>.csv
+
+which diffs per-metric averages, flags regressions past a tolerance, and
+exits non-zero if anything regressed — wire that into CI as its own gate
+once you've picked what counts as "baseline" for your pipeline (the last
+run on main, a pinned known-good CSV, etc.). See the README's "Regression
+testing" section for the full walkthrough.
 """
 
 from pathlib import Path
@@ -44,11 +60,19 @@ from pathlib import Path
 from deepeval.test_case import LLMTestCase
 import pytest
 
-from elyaeval import load_standard_dataset, evaluate_golden, new_report_path
+from elyaeval import load_standard_dataset, evaluate_golden, new_report_path, log_run_metadata
 from elyaeval.metrics import {metrics_constant}
 from elyaeval.run_contracts import RAGRunResult
 
 REPORT_CSV = new_report_path("{task_type}")
+
+# TODO 3 (optional): tag this run for later `elyaeval compare` regression
+# checks. Values must be strings/ints/floats. Delete the call entirely if
+# you don't want regression comparisons for this suite.
+# log_run_metadata(REPORT_CSV, {{
+#     "generator_model": os.environ.get("GENERATOR_MODEL", "unknown"),
+#     "prompt_version": os.environ.get("PROMPT_VERSION", "unknown"),
+# }})
 
 # TODO 1: import your app under test, e.g.:
 # from myapp.pipeline import answer_question

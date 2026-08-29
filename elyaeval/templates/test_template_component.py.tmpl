@@ -27,6 +27,8 @@ Requirements on the SUT side for this to produce anything:
 WHAT YOU NEED TO FILL IN (search for TODO):
   1. Import your app's traced entrypoint function (in-process, not HTTP).
   2. Implement call_sut() to invoke it for one golden.
+  3. (Optional, for regression testing) Fill in log_run_metadata() below
+     with whatever identifies THIS run's configuration.
 
 REPORT_CSV: one row per (golden, span, metric) triple, written to a
 SEPARATE csv from the e2e suite's REPORT_CSV — same append-as-you-go
@@ -34,6 +36,14 @@ convention, but with an extra span_name column so you can see which stage
 (e.g. "retrieve" vs "generate_answer") a given score belongs to. Point it
 at wherever your CI workspace collects reports; it defaults to a local
 report/ dir for running the suite by hand.
+
+REGRESSION TESTING (across model/prompt changes): log_run_metadata() tags
+this run with whatever config produced it — purely local, no Confident AI
+account needed for plain string/int/float values. Compare any two runs
+with `elyaeval compare --baseline ... --candidate ... --group-by
+span_name,metric_name` (span_name matters here since the same metric name
+can appear under more than one span) — see the README's "Regression
+testing" section.
 """
 
 from pathlib import Path
@@ -41,10 +51,18 @@ from pathlib import Path
 from deepeval.dataset import Golden
 import pytest
 
-from elyaeval import load_standard_dataset, new_report_path
+from elyaeval import load_standard_dataset, new_report_path, log_run_metadata
 from elyaeval.tracing_report import TracedRunner, golden_id, append_traced_csv_rows, traced_test_result_to_csv_rows
 
 REPORT_CSV = new_report_path("{task_type}_component")
+
+# TODO 3 (optional): tag this run for later `elyaeval compare` regression
+# checks. Values must be strings/ints/floats. Delete the call entirely if
+# you don't want regression comparisons for this suite.
+# log_run_metadata(REPORT_CSV, {{
+#     "generator_model": os.environ.get("GENERATOR_MODEL", "unknown"),
+#     "prompt_version": os.environ.get("PROMPT_VERSION", "unknown"),
+# }})
 
 # TODO 1: import your app's traced entrypoint, in-process, e.g.:
 # from rag_core import run_for_eval

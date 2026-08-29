@@ -232,6 +232,74 @@ elyaeval report --csv report/results_rag_qa_component_20260825T130500Z.csv --gro
 Writes `<csv-stem>.html` next to the CSV (or pass `--html` for a different path) and prints the same
 averages table.
 
+## Regression testing (across model/prompt changes)
+
+Two independent pieces: tagging a run with what config produced it, and diffing two runs' scores
+against each other. Neither needs a Confident AI account — both work purely off elyaeval's own CSVs.
+
+### Tagging a run: `log_run_metadata`
+
+Call once per test session (module level, right after `REPORT_CSV` is assigned — see TODO 3 in the
+generated template) with whatever identifies this run's configuration:
+
+```python
+from elyaeval import log_run_metadata
+
+log_run_metadata(REPORT_CSV, {
+    "generator_model": os.environ.get("GENERATOR_MODEL", "unknown"),
+    "prompt_version": os.environ.get("PROMPT_VERSION", "unknown"),
+})
+```
+
+Values must be strings, ints, or floats. This does two things: calls DeepEval's own
+`deepeval.log_hyperparameters()` with the same dict (shows up in DeepEval's own terminal output and,
+if `DEEPEVAL_RESULTS_FOLDER` is set, its `test_run_*.json`) — genuinely local for plain values, it
+only talks to Confident AI if you pass one of DeepEval's `Prompt` objects instead, which this
+function doesn't accept. It also writes a sidecar `<csv-stem>.meta.json` next to your CSV, which is
+what `elyaeval compare` (below) actually reads — kept independent of `DEEPEVAL_RESULTS_FOLDER` and
+DeepEval's own JSON schema, so comparisons work whether or not you've set that env var.
+
+**`log_hyperparameters` only tags a run — it doesn't compare anything by itself.** DeepEval's actual
+run-to-run comparison dashboard is a Confident AI feature. The comparison below is elyaeval's own,
+local equivalent.
+
+### Comparing two runs: `elyaeval compare`
+
+```bash
+elyaeval compare --baseline report/results_rag_qa_20260820T090000Z.csv \
+                  --candidate report/results_rag_qa_20260826T090000Z.csv
+```
+
+Diffs per-metric averages (`metric_averages()` under the hood) between the two CSVs and prints a
+table:
+
+```
+Baseline config: generator_model=llama3.1, prompt_version=v2, chunk_size=512
+Candidate config: generator_model=llama3.1-8b-instant, prompt_version=v3, chunk_size=512
+
+metric            baseline  candidate     delta  status
+------------------------------------------------------------
+Faithfulness          0.88       0.65    -0.225  ▼ REGRESSED
+AnswerRelevancy       0.86       0.86    +0.000  = unchanged
+
+1 metric(s) regressed beyond tolerance.
+```
+
+- `--tolerance` (default `0.02`): absolute avg-score drop that counts as a regression. A metric
+  landing within tolerance is `unchanged`, not `improved`/`regressed` — a ±0.001 wobble from LLM-judge
+  noise shouldn't read as either.
+- `--group-by` (default `metric_name`; use `span_name,metric_name` for component CSVs): same grouping
+  `metric_averages()`/`elyaeval report` use.
+- A metric only present in one of the two runs is flagged `new` or `removed`, not `regressed` —
+  something appearing or disappearing between runs isn't the same claim as an existing metric
+  scoring worse, and deserves its own callout (did a pipeline stage get added/dropped? did the suite
+  change?) rather than being silently absorbed into the regression count.
+- `--html <path>` also writes an HTML regression report — the same comparison table, plus each run's
+  logged config side by side (if `log_run_metadata` was called for either), so a reader sees WHAT
+  changed alongside the score deltas it produced.
+- **Exit code is 0 if nothing regressed beyond tolerance, 1 if anything did** — this is what
+  `check-regression` (below) gates the pipeline on directly.
+
 ## CI/CD (Tekton)
 
 `elyaeval init-ci` generates the per-repo `PipelineRun` stub that runs your generated suite against
@@ -249,3 +317,53 @@ The Pipeline/Task definitions themselves are centralized, not generated per repo
 from `new_report_path()` carries straight through into the blob name). It uploads each CSV's
 `results_*.html` sibling the same way, as `<run-id>_<suffix>.html`, if the HTML file exists —
 older runs with no HTML sibling are skipped silently, not treated as an error.
+
+### Two independent gates
+
+The pipeline fails a run for either of two different reasons, enforced by two different `finally`
+tasks:
+
+- **`check-results`** — gates on each individual metric's threshold, same run, no history involved.
+  Already existed: DeepEval marks a test `failed` when a score misses its threshold, `check-results`
+  reads that out of `junit.xml`.
+- **`check-regression`** (new) — gates on this run's per-metric *averages* against a **baseline**
+  from a previous run, via `elyaeval compare` under the hood. A run can clear every metric's
+  threshold and still fail this gate if it scored meaningfully worse than the baseline it's compared
+  against — that's the "regression across model/prompt changes" case threshold-gating alone can't
+  catch (nothing dropped below threshold, but everything got worse).
+
+Both are ordinary `finally` tasks — either one failing fails the `PipelineRun` overall, independent
+of the other.
+
+### How the baseline works
+
+`check-regression` compares against a **stable, non-timestamped blob**, `baseline_<task-type>.csv`
+(e.g. `baseline_rag_qa.csv`, `baseline_rag_qa_component.csv` — one per test-file "shape", derived
+automatically from the CSV filename, same container as everything else). This is deliberately
+**self-gating, no separate on/off switch needed**:
+
+- No baseline blob yet → every run just logs `No baseline blob 'baseline_rag_qa.csv' yet` and passes.
+  Adding this Task to an existing pipeline doesn't fail anyone's very first run after upgrading.
+- A baseline exists → every subsequent run compares against it automatically.
+- Nothing promotes (overwrites) the baseline unless a run explicitly asks to, via the
+  `promote-baseline` param (default `"false"`) — see below.
+
+Set `promote-baseline: "true"` only on `PipelineRun`s you deliberately want to become the new
+known-good state (a main-branch run, a nightly run against a stable SUT deployment — whatever your
+pipeline trigger setup treats as "this passed, trust it"). Leave it `"false"` for ordinary/PR runs,
+so a single PR can never silently move the baseline every other PR compares against. **Promotion only
+happens if the comparison itself passed** — `check-regression`'s three steps
+(`download-baseline` → `compare` → `promote-baseline`) run in that fixed order within the same Task,
+and Tekton skips later steps once one fails, so a regressed run never reaches the promote step
+regardless of what `promote-baseline` is set to.
+
+```yaml
+# in your pipelinerun.yaml, or via --param on a manual `tkn pipeline start`:
+- name: regression-tolerance
+  value: "0.02"      # default — override if a metric's judge is noisier/stricter than that
+- name: promote-baseline
+  value: "false"     # "true" only for runs that should become the new baseline
+```
+
+The very first time you want a baseline to exist at all, run once with `promote-baseline: "true"` —
+`check-regression` bootstraps it from that run's CSV since there's nothing to compare against yet.
