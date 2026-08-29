@@ -9,7 +9,6 @@ from .html_report import (
     render_html_report,
     total_cost,
 )
-from .hyperparameters import log_run_metadata, read_run_metadata
 
 __all__ = [
     "load_standard_dataset",
@@ -20,8 +19,6 @@ __all__ = [
     "metric_averages",
     "read_csv_rows",
     "total_cost",
-    "log_run_metadata",
-    "read_run_metadata",
     "compare_runs",
     "render_comparison_html",
 ]

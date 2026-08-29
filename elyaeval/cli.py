@@ -24,7 +24,6 @@ from elyaeval.html_report import (
     render_comparison_html,
     render_html_report,
 )
-from elyaeval.hyperparameters import read_run_metadata
 
 _TASK_TYPE_TO_METRICS_CONSTANT = {
     "rag_qa": "RAG_METRICS",
@@ -229,12 +228,6 @@ def compare(
     from main, or from before a prompt change) and --candidate at the CSV
     from the run you want to check.
 
-    If log_run_metadata() was called for either run (see
-    elyaeval.hyperparameters), the sidecar .meta.json's hyperparameters
-    are printed for both sides too, so you can see WHAT changed (model,
-    prompt version, ...) alongside the score deltas it produced — not
-    required, just picked up automatically if present.
-
     Returns 0 if nothing regressed beyond `tolerance`, 1 if anything did —
     meant to be used as this command's process exit code so a CI step can
     gate on it directly, the same way check-results already gates on
@@ -252,15 +245,6 @@ def compare(
     candidate_rows = read_csv_rows(candidate_path)
     comparisons = compare_runs(baseline_rows, candidate_rows, group_keys=keys, tolerance=tolerance)
 
-    baseline_meta = read_run_metadata(baseline_path)
-    candidate_meta = read_run_metadata(candidate_path)
-    for label, meta in (("Baseline", baseline_meta), ("Candidate", candidate_meta)):
-        hp = meta.get("hyperparameters")
-        if hp:
-            print(f"{label} config: " + ", ".join(f"{k}={v}" for k, v in hp.items()))
-    if baseline_meta or candidate_meta:
-        print()
-
     print(f"Baseline:  {baseline_path}")
     print(f"Candidate: {candidate_path}")
     print(f"Tolerance: ±{tolerance}\n")
@@ -272,8 +256,6 @@ def compare(
             group_keys=keys,
             html_path=html_path,
             title=f"{candidate_path.stem} vs {baseline_path.stem}",
-            baseline_meta=baseline_meta or None,
-            candidate_meta=candidate_meta or None,
         )
         print(f"\nWrote {out}")
 
