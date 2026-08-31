@@ -437,13 +437,28 @@ spec:
 # promote-baseline are completely unaffected by adding this Task. Once a
 # baseline exists, every subsequent run compares against it automatically.
 #
-# THREE STEPS, DELIBERATELY SEQUENTIAL (not independent, unlike
-# check-results/report-results in the finally block) — download-baseline
-# must finish before compare can read it, and compare must PASS (exit 0)
-# before promote-baseline runs, since Tekton skips later steps in a Task
-# once an earlier one fails. That's what stops a regressed run from ever
-# overwriting the baseline it just failed against — no extra conditional
-# logic needed for that, it falls out of normal step-failure semantics.
+# FIVE STEPS, DELIBERATELY SEQUENTIAL (not independent, unlike
+# check-results/report-results in the finally block):
+#   download-baseline -> compare -> upload-regression-report ->
+#   check-regression-status -> promote-baseline
+#
+# compare DELIBERATELY NEVER FAILS ITSELF (unlike an earlier version of
+# this Task) — it only writes a marker file recording whether anything
+# regressed. The actual gate is check-regression-status, its own step,
+# AFTER upload-regression-report. Splitting it this way is what makes the
+# regression HTML report get uploaded even on a run that's about to fail
+# this gate — the one case you most want to see it for. If compare failed
+# the Task directly, Tekton would skip every step after it, including the
+# upload, and a real regression's report would be generated on the pod and
+# then simply discarded when it tore down.
+#
+# check-regression-status failing (and ONLY that step failing) is what
+# stops promote-baseline from running — Tekton skips remaining steps in a
+# Task once an earlier one fails, so a regressed run never reaches
+# promote-baseline regardless of that param's value. No extra conditional
+# logic needed for that guarantee, it falls out of normal step-failure
+# semantics — same as before, just moved one step later so upload happens
+# first.
 #
 # STABLE_NAME: baseline blob names strip BOTH the results_ prefix and the
 # trailing _<UTC timestamp> (format YYYYMMDDTHHMMSSZ, fixed-width, matches
@@ -452,7 +467,11 @@ spec:
 # the part that's stable run-to-run for the SAME test-file/task-type, which
 # is what makes "baseline_rag_qa_component.csv" a meaningful blob to keep
 # comparing against and overwriting, rather than a one-off per run like the
-# timestamped blobs report-results uploads.
+# timestamped blobs report-results uploads. The regression HTML report
+# itself, by contrast, gets a run-specific blob name
+# (<run-id>_regression_<stable>.html, mirroring report-results' own
+# <run-id>_<suffix> convention) since its content is specific to this one
+# comparison, not something later runs should overwrite.
 apiVersion: tekton.dev/v1
 kind: Task
 metadata:
@@ -468,6 +487,9 @@ spec:
     - name: blob-connection-string-secret-key
       type: string
       description: Key within that Secret holding the connection string
+    - name: run-id
+      type: string
+      description: "Unique name for this PipelineRun (used to name the uploaded regression-report blob) — pass $(context.pipelineRun.name)."
     - name: regression-tolerance
       type: string
       default: "0.02"
@@ -529,10 +551,16 @@ spec:
         #!/bin/sh
         set -eu
 
-        REGRESSED=0
+        # Deliberately never `exit 1` from THIS step — see the Task-level
+        # comment above for why. Any regression found gets recorded in
+        # this marker file instead; the actual gate is
+        # check-regression-status, after the upload step has already run.
+        MARKER="$(workspaces.source.path)/report/.regression_failed"
+        rm -f "$MARKER"
+
         for CSV in "$(workspaces.source.path)"/report/results_*.csv; do
           [ -e "$CSV" ] || continue
-          python - "$CSV" "$(workspaces.source.path)/report" "$(params.regression-tolerance)" <<'PYEOF' || REGRESSED=1
+          python - "$CSV" "$(workspaces.source.path)/report" "$(params.regression-tolerance)" <<'PYEOF' || echo "1" >> "$MARKER"
         import os
         import re
         import subprocess
@@ -567,11 +595,63 @@ spec:
         PYEOF
         done
 
-        if [ "$REGRESSED" -eq 1 ]; then
+        if [ -s "$MARKER" ]; then
+          echo "✗ Regression detected against baseline — will fail this Task after uploading the report"
+        else
+          echo "✓ No regressions against baseline (or no baseline existed yet to compare against)"
+        fi
+
+    - name: upload-regression-report
+      image: mcr.microsoft.com/azure-cli:2.65.0
+      env:
+        - name: AZURE_STORAGE_CONNECTION_STRING
+          valueFrom:
+            secretKeyRef:
+              name: $(params.blob-connection-string-secret-name)
+              key: $(params.blob-connection-string-secret-key)
+      script: |
+        #!/bin/sh
+        set -eu
+
+        # Runs UNCONDITIONALLY — regardless of what `compare` found —
+        # since this step comes before the gate below. This is the fix:
+        # the comparison report for a run that's ABOUT to fail this gate
+        # still gets uploaded, instead of being generated on the pod and
+        # thrown away the moment it tears down.
+        RUN_ID="$(params.run-id)"
+        FOUND=0
+        for HTML in "$(workspaces.source.path)"/report/regression_*.html; do
+          [ -e "$HTML" ] || continue
+          FOUND=1
+          BLOB_NAME="${RUN_ID}_$(basename "$HTML")"
+          az storage blob upload \
+            --container-name "$(params.blob-container)" \
+            --file "$HTML" \
+            --name "$BLOB_NAME" \
+            --overwrite \
+            --only-show-errors
+          echo "✓ Uploaded $HTML to container $(params.blob-container) as $BLOB_NAME"
+        done
+        if [ "$FOUND" -eq 0 ]; then
+          echo "ℹ No regression_*.html files this run (no baseline existed yet to compare against) — nothing to upload"
+        fi
+
+    - name: check-regression-status
+      image: python:3.11-slim
+      script: |
+        #!/bin/sh
+        set -eu
+
+        # The actual gate — deliberately its own step, AFTER the upload
+        # above, so a failure here (which stops promote-baseline from
+        # running, same as before) never stops the report upload from
+        # having already happened.
+        MARKER="$(workspaces.source.path)/report/.regression_failed"
+        if [ -s "$MARKER" ]; then
           echo "✗ Regression detected against baseline — failing this Task"
           exit 1
         fi
-        echo "✓ No regressions against baseline (or no baseline existed yet to compare against)"
+        echo "✓ Nothing regressed — proceeding"
 
     - name: promote-baseline
       image: mcr.microsoft.com/azure-cli:2.65.0
@@ -585,9 +665,10 @@ spec:
         #!/bin/sh
         set -eu
 
-        # This step only ever runs if `compare` above exited 0 — Tekton
-        # skips remaining steps in a Task once one fails, so a regressed
-        # run never reaches here regardless of this param's value.
+        # This step only ever runs if check-regression-status above exited
+        # 0 — Tekton skips remaining steps in a Task once an earlier one
+        # fails, so a regressed run never reaches here regardless of this
+        # param's value.
         if [ "$(params.promote-baseline)" != "true" ]; then
           echo "promote-baseline is not 'true' — leaving existing baseline(s) unchanged"
           exit 0

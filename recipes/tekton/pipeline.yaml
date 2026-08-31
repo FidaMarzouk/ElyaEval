@@ -219,6 +219,8 @@ spec:
             value: $(params.blob-connection-string-secret-name)
           - name: blob-connection-string-secret-key
             value: $(params.blob-connection-string-secret-key)
+          - name: run-id
+            value: $(context.pipelineRun.name)
           - name: regression-tolerance
             value: $(params.regression-tolerance)
           - name: promote-baseline
