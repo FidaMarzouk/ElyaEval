@@ -4,7 +4,7 @@ version = "0.4.0"
 description = "Starter kit for DeepEval-based CI/CD testing: standard dataset, metric presets, and a pytest-file generator."
 requires-python = ">=3.10"
 dependencies = [
-    "deepeval==4.0",
+    "deepeval>=4.0,<5.0",
     "pytest>=7.0",
 ]
 
