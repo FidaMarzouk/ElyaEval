@@ -563,7 +563,6 @@ spec:
           python - "$CSV" "$(workspaces.source.path)/report" "$(params.regression-tolerance)" <<'PYEOF' || echo "1" >> "$MARKER"
         import os
         import re
-        import subprocess
         import sys
 
         csv_path, report_dir, tolerance = sys.argv[1], sys.argv[2], sys.argv[3]
@@ -583,15 +582,27 @@ spec:
         group_by = "span_name,metric_name" if "component" in stable else "metric_name"
         html_path = os.path.join(report_dir, f"regression_{stable}.html")
 
-        result = subprocess.run([
-            "elyaeval", "compare",
-            "--baseline", baseline_path,
-            "--candidate", csv_path,
-            "--tolerance", tolerance,
-            "--group-by", group_by,
-            "--html", html_path,
-        ])
-        sys.exit(result.returncode)
+        # Call elyaeval's compare() function directly, in-process, rather
+        # than shelling out to an `elyaeval` command via subprocess. The
+        # `elyaeval` CONSOLE SCRIPT (the wrapper executable pip normally
+        # installs alongside a package) is never on PATH here — this step
+        # only sets PYTHONPATH, which makes `import elyaeval` work but does
+        # nothing for shell command lookup. subprocess.run(["elyaeval", ...])
+        # failed with FileNotFoundError for exactly that reason: it isn't
+        # a python/import problem, it's that there's no such executable to
+        # find. Importing and calling the function directly sidesteps this
+        # entirely — no dependency on how the package happened to be
+        # installed, no PATH to get right.
+        from elyaeval.cli import compare as elyaeval_compare
+
+        exit_code = elyaeval_compare(
+            baseline_path,
+            csv_path,
+            tolerance=float(tolerance),
+            group_by=group_by,
+            html_path=html_path,
+        )
+        sys.exit(exit_code)
         PYEOF
         done
 
