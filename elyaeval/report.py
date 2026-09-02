@@ -45,6 +45,8 @@ CSV_FIELDS = [
     "error",
     "evaluation_model",
     "evaluation_cost",
+    "input_tokens",
+    "output_tokens",
 ]
 
 
@@ -106,7 +108,16 @@ def test_result_to_csv_rows(golden_id: str, priority: str, test_result: TestResu
     token counts on the public API, only cost, and only when the judge
     model has known per-token pricing built in (OpenAI/Anthropic/etc.) — a
     local/custom judge with no pricing config leaves this None, same as it
-    shows "token cost: None" in DeepEval's terminal output rather than $0."""
+    shows "token cost: None" in DeepEval's terminal output rather than $0.
+
+    input_tokens/output_tokens ARE raw token counts, added to MetricData in
+    DeepEval 4.2 — read via getattr(..., None) rather than md.input_tokens
+    directly because pyproject.toml pins deepeval>=4.0,<5.0, and on an
+    older 4.0.x/4.1.x install this attribute simply doesn't exist on the
+    pydantic model yet (accessing it directly would raise AttributeError,
+    not return None). Same None-means-unknown convention as
+    evaluation_cost applies here too: a local/custom judge may not report
+    usage at all, and an older DeepEval version never will."""
     rows = []
     for md in test_result.metrics_data or []:
         rows.append({
@@ -121,6 +132,8 @@ def test_result_to_csv_rows(golden_id: str, priority: str, test_result: TestResu
             "error": md.error,
             "evaluation_model": md.evaluation_model,
             "evaluation_cost": md.evaluation_cost,
+            "input_tokens": getattr(md, "input_tokens", None),
+            "output_tokens": getattr(md, "output_tokens", None),
         })
     return rows
 

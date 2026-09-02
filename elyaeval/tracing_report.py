@@ -59,6 +59,8 @@ TRACED_CSV_FIELDS = [
     "error",
     "evaluation_model",
     "evaluation_cost",
+    "input_tokens",
+    "output_tokens",
 ]
 
 
@@ -105,11 +107,13 @@ def append_traced_csv_rows(csv_path: str | Path, rows: list[dict]) -> None:
 def traced_test_result_to_csv_rows(golden_id: str, priority: str, test_result: TestResult) -> list[dict]:
     """One row per metric in test_result.metrics_data, same convention as
     report.test_result_to_csv_rows (including evaluation_model/
-    evaluation_cost — see that function's docstring for what DeepEval does
-    and doesn't expose there), plus span_name (test_result.name — the
-    @observe'd function name for a span-level result). A result with no
-    metrics_data (the trace-level result, here) simply produces no rows —
-    nothing was scored, so there's nothing to write."""
+    evaluation_cost/input_tokens/output_tokens — see that function's
+    docstring for what DeepEval does and doesn't expose there, and why the
+    two token fields are read via getattr(..., None) rather than direct
+    attribute access), plus span_name (test_result.name — the @observe'd
+    function name for a span-level result). A result with no metrics_data
+    (the trace-level result, here) simply produces no rows — nothing was
+    scored, so there's nothing to write."""
     rows = []
     for md in test_result.metrics_data or []:
         rows.append({
@@ -125,6 +129,8 @@ def traced_test_result_to_csv_rows(golden_id: str, priority: str, test_result: T
             "error": md.error,
             "evaluation_model": md.evaluation_model,
             "evaluation_cost": md.evaluation_cost,
+            "input_tokens": getattr(md, "input_tokens", None),
+            "output_tokens": getattr(md, "output_tokens", None),
         })
     return rows
 

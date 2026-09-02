@@ -8,6 +8,7 @@ from .html_report import (
     render_comparison_html,
     render_html_report,
     total_cost,
+    total_tokens,
 )
 
 __all__ = [
@@ -19,6 +20,7 @@ __all__ = [
     "metric_averages",
     "read_csv_rows",
     "total_cost",
+    "total_tokens",
     "compare_runs",
     "render_comparison_html",
 ]

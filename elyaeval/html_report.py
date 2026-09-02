@@ -51,10 +51,11 @@ def session_reports() -> dict[Path, tuple[str, ...]]:
 
 def read_csv_rows(csv_path: str | Path) -> list[dict]:
     """Read a report CSV back into a list of dicts, coercing score/threshold/
-    evaluation_cost to float and success to bool where possible. Rows are
-    returned in file order (i.e. the order goldens actually ran in), which
-    is also the order the detail table renders in — no re-sorting happens
-    later on the (mistaken) assumption that CSV order is arbitrary."""
+    evaluation_cost to float, input_tokens/output_tokens to int, and
+    success to bool where possible. Rows are returned in file order (i.e.
+    the order goldens actually ran in), which is also the order the detail
+    table renders in — no re-sorting happens later on the (mistaken)
+    assumption that CSV order is arbitrary."""
     path = Path(csv_path)
     if not path.exists():
         return []
@@ -64,12 +65,15 @@ def read_csv_rows(csv_path: str | Path) -> list[dict]:
         row["score"] = _to_float(row.get("score"))
         row["threshold"] = _to_float(row.get("threshold"))
         row["success"] = _to_bool(row.get("success"))
-        # Older CSVs written before cost tracking was added simply have no
-        # evaluation_cost/evaluation_model column at all — csv.DictReader
-        # then leaves them missing from the dict entirely rather than "",
-        # so .get(...) (not [...]) everywhere downstream, and this coerces
-        # a genuinely absent column the same way as a blank one: None.
+        # Older CSVs written before cost/token tracking was added simply
+        # have no evaluation_cost/evaluation_model/input_tokens/
+        # output_tokens column at all — csv.DictReader then leaves them
+        # missing from the dict entirely rather than "", so .get(...) (not
+        # [...]) everywhere downstream, and this coerces a genuinely
+        # absent column the same way as a blank one: None.
         row["evaluation_cost"] = _to_float(row.get("evaluation_cost"))
+        row["input_tokens"] = _to_int(row.get("input_tokens"))
+        row["output_tokens"] = _to_int(row.get("output_tokens"))
     return rows
 
 
@@ -78,6 +82,15 @@ def _to_float(value) -> Optional[float]:
         return None
     try:
         return float(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def _to_int(value) -> Optional[int]:
+    if value in (None, ""):
+        return None
+    try:
+        return int(float(value))
     except (TypeError, ValueError):
         return None
 
@@ -126,6 +139,16 @@ def metric_averages(rows: list[dict], group_keys: tuple[str, ...] = ("metric_nam
       - evaluation_model: the judge model name, IF every row in the group
                       shares the same one; "multiple" if they differ (e.g.
                       you changed the judge mid-run); None if absent
+      - total_input_tokens / total_output_tokens: sum of input_tokens/
+                      output_tokens across every row in the group that had
+                      a value. Same None-means-unknown convention as
+                      total_cost — DeepEval only started reporting these at
+                      all in 4.2, and even then only for judges whose
+                      provider actually returns token usage, so an older
+                      DeepEval version or an unpriced/local judge both
+                      leave this None rather than 0.
+      - tokens_n:     how many rows actually contributed a token count —
+                      same purpose as cost_n, for the same reason
 
     Rows with an `error` value are still counted in n and pass_count/n
     (success is already False for them from evaluate_golden), just
@@ -153,6 +176,8 @@ def metric_averages(rows: list[dict], group_keys: tuple[str, ...] = ("metric_nam
         thresholds = {r["threshold"] for r in group_rows if r.get("threshold") is not None}
         costs = [r["evaluation_cost"] for r in group_rows if r.get("evaluation_cost") is not None]
         models = {r["evaluation_model"] for r in group_rows if r.get("evaluation_model")}
+        input_tokens_vals = [r["input_tokens"] for r in group_rows if r.get("input_tokens") is not None]
+        output_tokens_vals = [r["output_tokens"] for r in group_rows if r.get("output_tokens") is not None]
 
         summary = dict(zip(group_keys, key))
         summary["n"] = len(group_rows)
@@ -169,6 +194,9 @@ def metric_averages(rows: list[dict], group_keys: tuple[str, ...] = ("metric_nam
         summary["evaluation_model"] = (
             models.pop() if len(models) == 1 else ("multiple" if len(models) > 1 else None)
         )
+        summary["total_input_tokens"] = sum(input_tokens_vals) if input_tokens_vals else None
+        summary["total_output_tokens"] = sum(output_tokens_vals) if output_tokens_vals else None
+        summary["tokens_n"] = len(input_tokens_vals) or len(output_tokens_vals)
         summaries.append(summary)
     return summaries
 
@@ -182,6 +210,19 @@ def total_cost(rows: list[dict]) -> Optional[float]:
     rather than $0), not conflating "unknown" with "free"."""
     costs = [r.get("evaluation_cost") for r in rows if r.get("evaluation_cost") is not None]
     return sum(costs) if costs else None
+
+
+def total_tokens(rows: list[dict]) -> tuple[Optional[int], Optional[int]]:
+    """(total_input_tokens, total_output_tokens) across ALL rows,
+    independent of grouping — same purpose as total_cost() but for raw
+    token counts (DeepEval 4.2+ only — see test_result_to_csv_rows'
+    docstring in report.py). Each side is None independently if no row
+    in the run reported that value, same None-means-unknown convention
+    used throughout — an older DeepEval version or an unpriced/local
+    judge leaves both None, not 0."""
+    inputs = [r.get("input_tokens") for r in rows if r.get("input_tokens") is not None]
+    outputs = [r.get("output_tokens") for r in rows if r.get("output_tokens") is not None]
+    return (sum(inputs) if inputs else None, sum(outputs) if outputs else None)
 
 
 _CSS = """
@@ -264,6 +305,12 @@ def _fmt_cost(value: Optional[float]) -> str:
     return f"${value:.4f}"
 
 
+def _fmt_tokens(value: Optional[int]) -> str:
+    """Thousands-separated integer, "—" if None (unknown/unavailable —
+    see total_tokens()'s docstring), never "0" standing in for unknown."""
+    return "—" if value is None else f"{value:,}"
+
+
 def _score_bar(value: Optional[float], threshold: Optional[float]) -> str:
     if value is None:
         return "—"
@@ -290,6 +337,8 @@ def _summary_table(rows: list[dict], group_keys: tuple[str, ...]) -> str:
         "Threshold",
         "Judge model",
         "Total cost",
+        "Input tokens",
+        "Output tokens",
     ]
     head_html = "".join(f"<th>{_esc(h)}</th>" for h in headers)
 
@@ -297,6 +346,7 @@ def _summary_table(rows: list[dict], group_keys: tuple[str, ...]) -> str:
     for s in summaries:
         key_cells = "".join(f"<td>{_esc(s[k])}</td>" for k in group_keys)
         cost_note = f" ({s['cost_n']}/{s['n']} priced)" if s["cost_n"] and s["cost_n"] < s["n"] else ""
+        tokens_note = f" ({s['tokens_n']}/{s['n']} reported)" if s["tokens_n"] and s["tokens_n"] < s["n"] else ""
         body_rows.append(
             "<tr>"
             f"{key_cells}"
@@ -310,6 +360,9 @@ def _summary_table(rows: list[dict], group_keys: tuple[str, ...]) -> str:
             f'<td>{_esc(s["evaluation_model"] or "—")}</td>'
             f'<td class="num">{_fmt_cost(s["total_cost"])}'
             f'<span class="reason">{cost_note}</span></td>'
+            f'<td class="num">{_fmt_tokens(s["total_input_tokens"])}'
+            f'<span class="reason">{tokens_note}</span></td>'
+            f'<td class="num">{_fmt_tokens(s["total_output_tokens"])}</td>'
             "</tr>"
         )
 
@@ -332,6 +385,8 @@ def _detail_table(rows: list[dict], extra_columns: tuple[str, ...] = ()) -> str:
         "Result",
         "Judge model",
         "Cost",
+        "In tokens",
+        "Out tokens",
         "Reason / error",
     ]
     head_html = "".join(f"<th>{_esc(h)}</th>" for h in headers)
@@ -359,6 +414,8 @@ def _detail_table(rows: list[dict], extra_columns: tuple[str, ...] = ()) -> str:
             f"<td>{result_html}</td>"
             f'<td>{_esc(r.get("evaluation_model") or "—")}</td>'
             f'<td class="num">{_fmt_cost(r.get("evaluation_cost"))}</td>'
+            f'<td class="num">{_fmt_tokens(r.get("input_tokens"))}</td>'
+            f'<td class="num">{_fmt_tokens(r.get("output_tokens"))}</td>'
             f'<td class="{reason_class}">{_esc(reason)}</td>'
             "</tr>"
         )
@@ -402,6 +459,7 @@ def render_html_report(
     extra_columns = tuple(k for k in group_keys if k != "metric_name")
     report_title = title or csv_path.stem
     run_cost = total_cost(rows)
+    run_input_tokens, run_output_tokens = total_tokens(rows)
 
     doc = f"""<!DOCTYPE html>
 <html lang="en">
@@ -417,6 +475,7 @@ def render_html_report(
   <span>Source: {_esc(csv_path.name)}</span>
   <span>Rows: {len(rows)}</span>
   <span>Total judge cost: {_fmt_cost(run_cost)}</span>
+  <span>Total tokens: {_fmt_tokens(run_input_tokens)} in / {_fmt_tokens(run_output_tokens)} out</span>
 </div>
 <h2>Per-metric summary</h2>
 {_summary_table(rows, group_keys)}
@@ -450,28 +509,27 @@ def print_metric_averages(
     label_width = max(label_width, len("metric"))
     write(
         f"{'metric':<{label_width}}  {'avg':>6}  {'min':>6}  {'max':>6}  "
-        f"{'pass':>10}  {'cost':>10}  n"
+        f"{'pass':>10}  {'cost':>10}  {'in tok':>10}  {'out tok':>10}  n"
     )
-    write("-" * (label_width + 52))
+    write("-" * (label_width + 74))
     for s in summaries:
         label = " / ".join(str(s[k]) for k in group_keys)
         pass_str = f"{s['pass_count']}/{s['pass_total']}" if s["pass_total"] else "—"
         write(
             f"{label:<{label_width}}  {_fmt_score(s['avg_score']):>6}  "
             f"{_fmt_score(s['min_score']):>6}  {_fmt_score(s['max_score']):>6}  "
-            f"{pass_str:>10}  {_fmt_cost(s['total_cost']):>10}  {s['n']}"
+            f"{pass_str:>10}  {_fmt_cost(s['total_cost']):>10}  "
+            f"{_fmt_tokens(s['total_input_tokens']):>10}  {_fmt_tokens(s['total_output_tokens']):>10}  {s['n']}"
         )
+    run_input_tokens, run_output_tokens = total_tokens(rows)
     write(f"\nTotal judge cost for this run: {_fmt_cost(total_cost(rows))}")
+    write(f"Total tokens for this run: {_fmt_tokens(run_input_tokens)} in / {_fmt_tokens(run_output_tokens)} out")
 
 
 # ---------------------------------------------------------------------------
 # Regression comparison — diffing two runs' metric_averages() against each
-# other. This is what actually answers "did this change regress anything,"
-# which DeepEval's log_hyperparameters() does NOT do by itself — it only
-# tags a run with metadata; the comparison itself is a Confident-AI-
-# dashboard feature there. Everything below works purely off elyaeval's own
-# CSVs (+ optional hyperparameters.py sidecar JSON), so it needs no
-# Confident AI account.
+# other. Works purely off elyaeval's own CSVs, so it needs no Confident AI
+# account.
 # ---------------------------------------------------------------------------
 
 DEFAULT_REGRESSION_TOLERANCE = 0.02  # absolute avg_score drop that counts as a regression
@@ -605,15 +663,10 @@ def render_comparison_html(
     group_keys: tuple[str, ...] = ("metric_name",),
     html_path: Optional[str | Path] = None,
     title: str = "Regression comparison",
-    baseline_meta: Optional[dict] = None,
-    candidate_meta: Optional[dict] = None,
 ) -> Optional[Path]:
-    """HTML version of print_comparison, with an optional hyperparameters
-    diff at the top (from hyperparameters.read_run_metadata() on each side)
-    so a reader sees WHAT changed between the two runs' SUT config, not
-    just that scores moved. Returns None (writes nothing) if no html_path
-    given — pass one explicitly, there's no CSV to infer a path from here
-    since this compares two of them."""
+    """HTML version of print_comparison. Returns None (writes nothing) if
+    no html_path given — pass one explicitly, there's no CSV to infer a
+    path from here since this compares two of them."""
     status_class = {
         "regressed": "fail",
         "improved": "pass",
@@ -655,23 +708,6 @@ def render_comparison_html(
         "</table>"
     )
 
-    def _meta_block(label: str, meta: Optional[dict]) -> str:
-        hp = (meta or {}).get("hyperparameters") or {}
-        if not hp:
-            return f"<p><strong>{_esc(label)}:</strong> <em>no run metadata logged</em></p>"
-        items = "".join(f"<li><strong>{_esc(k)}:</strong> {_esc(v)}</li>" for k, v in hp.items())
-        return f"<p><strong>{_esc(label)}:</strong></p><ul>{items}</ul>"
-
-    meta_html = ""
-    if baseline_meta is not None or candidate_meta is not None:
-        meta_html = (
-            "<h2>Run configuration</h2>"
-            '<div style="display:flex; gap:2rem;">'
-            f'<div>{_meta_block("Baseline", baseline_meta)}</div>'
-            f'<div>{_meta_block("Candidate", candidate_meta)}</div>'
-            "</div>"
-        )
-
     n_regressed = sum(1 for c in comparisons if c["status"] == "regressed")
     verdict = (
         f'<p style="color:var(--fail); font-weight:600;">{n_regressed} metric(s) regressed beyond tolerance.</p>'
@@ -690,7 +726,6 @@ def render_comparison_html(
 <body>
 <h1>{_esc(title)}</h1>
 {verdict}
-{meta_html}
 <h2>Per-metric comparison</h2>
 {table_html}
 </body>
