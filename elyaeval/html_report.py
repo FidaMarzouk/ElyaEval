@@ -2,40 +2,54 @@
 Shared HTML rendering + per-metric averaging, used by both report.py
 (flat e2e CSVs) and tracing_report.py (span-aware component CSVs).
 
-Deliberately reads the CSV back off disk rather than taking rows directly
-from the pytest process's memory: evaluate_golden()/TracedRunner already
-append one row (or a few rows) to CSV per golden, one golden at a time, as
-the parametrized suite runs. Re-reading the file at the end is what lets a
-single function work for "generate the HTML for a run that just finished"
-(the plugin's pytest_sessionfinish hook) AND "regenerate the HTML for some
-run's CSV that already got uploaded to blob storage last week"
-(`elyaeval report`, see cli.py) without keeping any separate in-process
-state that only the first case could ever have.
-
-Score/threshold/success come back from csv.DictReader as strings — every
+Score/threshold/success come back from csv.DictReader as strings   every
 function below that touches them numerically goes through _coerce_row()
 first so a blank score (e.g. an errored metric) doesn't crash averaging,
 it's just excluded from that metric's mean.
+
+Styling lives in report_theme.css, next to this file, rather than as an
+inline string here that's used by BOTH renderers below (and any future
+one) but is checked into the repo as a normal, diffable stylesheet
+instead of a Python string. _load_css() reads it once per process and
+inlines it into every report's <style> tag, so the *output* HTML stays a
+single self-contained file (no external <link>, safe to open from a bare
+blob-storage download) while the *source* stays one file per concern.
 """
 
 from __future__ import annotations
 
 import csv
 import html as _html
+from functools import lru_cache
 from pathlib import Path
 from typing import Optional
 
+_THEME_CSS_PATH = Path(__file__).with_name("report_theme.css")
+
+
+@lru_cache(maxsize=1)
+def _load_css() -> str:
+    """Read report_theme.css once per process and cache it. Falls back to
+    a minimal inline stylesheet (rather than raising) if the file is ever
+    missing next to this module   a report that renders in plain-but-
+    readable CSS beats a broken pytest run over a stylesheet."""
+    try:
+        return _THEME_CSS_PATH.read_text(encoding="utf-8")
+    except OSError:
+        return (
+            "body{font-family:sans-serif;margin:2rem;}"
+            "table{border-collapse:collapse;width:100%;}"
+            "th,td{border:1px solid #ccc;padding:.4rem;text-align:left;}"
+        )
+
 
 # Populated by report.append_csv_rows / tracing_report.append_traced_csv_rows
-# as they write — every CSV path either module has EVER appended a row to
+# as they write every CSV path either module has EVER appended a row to
 # during this process, paired with the group_keys its rows should be
 # averaged by. plugin.py reads this at pytest_sessionfinish to know which
 # CSVs to render HTML for and print averages for, without needing the
-# generated test file itself to call anything new. A plain module-level
-# dict (not a fixture) because both writer functions are called from
-# ordinary functions, not fixtures, and can run under multiple test files
-# in one pytest session — last-write-wins per path is fine since group_keys
-# for a given csv_path never changes between calls in practice.
+# generated test file itself to call anything new.
+
 _SESSION_REPORTS: dict[Path, tuple[str, ...]] = {}
 
 
@@ -52,10 +66,8 @@ def session_reports() -> dict[Path, tuple[str, ...]]:
 def read_csv_rows(csv_path: str | Path) -> list[dict]:
     """Read a report CSV back into a list of dicts, coercing score/threshold/
     evaluation_cost to float, input_tokens/output_tokens to int, and
-    success to bool where possible. Rows are returned in file order (i.e.
-    the order goldens actually ran in), which is also the order the detail
-    table renders in — no re-sorting happens later on the (mistaken)
-    assumption that CSV order is arbitrary."""
+    success to bool where possible. Rows are returned in file order, which is also the order the detail
+    table renders in."""
     path = Path(csv_path)
     if not path.exists():
         return []
@@ -65,12 +77,6 @@ def read_csv_rows(csv_path: str | Path) -> list[dict]:
         row["score"] = _to_float(row.get("score"))
         row["threshold"] = _to_float(row.get("threshold"))
         row["success"] = _to_bool(row.get("success"))
-        # Older CSVs written before cost/token tracking was added simply
-        # have no evaluation_cost/evaluation_model/input_tokens/
-        # output_tokens column at all — csv.DictReader then leaves them
-        # missing from the dict entirely rather than "", so .get(...) (not
-        # [...]) everywhere downstream, and this coerces a genuinely
-        # absent column the same way as a blank one: None.
         row["evaluation_cost"] = _to_float(row.get("evaluation_cost"))
         row["input_tokens"] = _to_int(row.get("input_tokens"))
         row["output_tokens"] = _to_int(row.get("output_tokens"))
@@ -105,59 +111,37 @@ def _to_bool(value) -> Optional[bool]:
 
 def metric_averages(rows: list[dict], group_keys: tuple[str, ...] = ("metric_name",)) -> list[dict]:
     """
-    Group `rows` by `group_keys` (default: just metric_name — pass
-    ("span_name", "metric_name") for the component CSV, where the same
-    metric name can appear under different spans, e.g. Faithfulness scored
-    on both "generate_answer" and some other span) and compute, per group:
-
       - n:            how many rows landed in this group (goldens tested)
-      - n_scored:     how many of those had a numeric score (excludes
-                      rows where the metric errored and score is blank)
+      - n_scored:     how many of those had a numeric score
       - avg_score:    mean of the numeric scores, or None if n_scored == 0
       - min_score / max_score: same population
       - pass_count / pass_rate: from the `success` column (True/False),
-                      independent of avg_score — a metric can average
-                      above its threshold while still failing goldens if
-                      the failures are offset by very high scores elsewhere,
-                      so both numbers are kept rather than inferring one
-                      from the other
+                      independent of avg_score
       - threshold:    the threshold value, IF every row in the group shares
-                      the same one (the normal case — a metric's threshold
+                      the same one (the normal case a metric's threshold
                       is fixed per suite); None if goldens in this group
                       used different thresholds, so a caller can't silently
                       display one that isn't actually representative
       - total_cost:   sum of evaluation_cost (USD) across every row in the
                       group that had a cost value. None (not 0) if NO row
-                      in the group had a cost — distinguishes "this judge
-                      model has no known pricing, cost is unknown" from
-                      "this judge model is free" (0.0), the same way
-                      DeepEval's own terminal summary shows "token cost:
-                      None" rather than $0 for an unpriced/local model.
-      - cost_n:       how many rows actually contributed a cost value —
+                      in the group had a cost
+      - cost_n:       how many rows actually contributed a cost value  
                       lets a caller tell "$0.0031 from 4 metrics" apart
                       from "$0.0031 from 1 metric, other 3 unpriced"
-      - evaluation_model: the judge model name, IF every row in the group
-                      shares the same one; "multiple" if they differ (e.g.
-                      you changed the judge mid-run); None if absent
+      - evaluation_model: the judge model name,
       - total_input_tokens / total_output_tokens: sum of input_tokens/
                       output_tokens across every row in the group that had
                       a value. Same None-means-unknown convention as
-                      total_cost — DeepEval only started reporting these at
+                      total_cost (DeepEval only started reporting these at
                       all in 4.2, and even then only for judges whose
                       provider actually returns token usage, so an older
                       DeepEval version or an unpriced/local judge both
-                      leave this None rather than 0.
-      - tokens_n:     how many rows actually contributed a token count —
+                      leave this None rather than 0).
+      - tokens_n:     how many rows actually contributed a token count  
                       same purpose as cost_n, for the same reason
 
-    Rows with an `error` value are still counted in n and pass_count/n
-    (success is already False for them from evaluate_golden), just
-    excluded from avg/min/max if their score is blank — an errored metric
-    with no score shouldn't silently pull an average toward 0.
 
-    Returns groups in first-seen order (matches CSV/golden run order), not
-    sorted alphabetically — keeps e.g. metrics in the same order the suite
-    declared them (RAG_METRICS list order) rather than shuffling by name.
+    Returns groups in first-seen order (matches CSV/golden run order)
     """
     order: list[tuple] = []
     buckets: dict[tuple, list[dict]] = {}
@@ -203,7 +187,7 @@ def metric_averages(rows: list[dict], group_keys: tuple[str, ...] = ("metric_nam
 
 def total_cost(rows: list[dict]) -> Optional[float]:
     """Sum of evaluation_cost (USD) across ALL rows, independent of
-    grouping — the single "what did this whole run cost the judge model"
+    grouping   the single "what did this whole run cost the judge model"
     number for the HTML header / terminal summary. None if no row in the
     run has a cost value at all (e.g. a local/unpriced judge model, same
     case DeepEval's own terminal summary shows as "token cost: None"
@@ -214,69 +198,18 @@ def total_cost(rows: list[dict]) -> Optional[float]:
 
 def total_tokens(rows: list[dict]) -> tuple[Optional[int], Optional[int]]:
     """(total_input_tokens, total_output_tokens) across ALL rows,
-    independent of grouping — same purpose as total_cost() but for raw
-    token counts (DeepEval 4.2+ only — see test_result_to_csv_rows'
-    docstring in report.py). Each side is None independently if no row
-    in the run reported that value, same None-means-unknown convention
-    used throughout — an older DeepEval version or an unpriced/local
-    judge leaves both None, not 0."""
+    independent of grouping"""
     inputs = [r.get("input_tokens") for r in rows if r.get("input_tokens") is not None]
     outputs = [r.get("output_tokens") for r in rows if r.get("output_tokens") is not None]
     return (sum(inputs) if inputs else None, sum(outputs) if outputs else None)
 
 
-_CSS = """
-:root {
-  color-scheme: light;
-  --pass: #1a7f37;
-  --fail: #cf222e;
-  --muted: #6e7781;
-  --border: #d0d7de;
-  --bg-alt: #f6f8fa;
-}
-* { box-sizing: border-box; }
-body {
-  font-family: -apple-system, "Segoe UI", Helvetica, Arial, sans-serif;
-  margin: 0;
-  padding: 2rem;
-  color: #1f2328;
-  background: #ffffff;
-}
-h1 { font-size: 1.4rem; margin: 0 0 0.15rem; }
-h2 { font-size: 1.1rem; margin: 2rem 0 0.75rem; }
-.meta { color: var(--muted); font-size: 0.85rem; margin-bottom: 1.5rem; }
-.meta span { margin-right: 1.25rem; }
-table {
-  border-collapse: collapse;
-  width: 100%;
-  font-size: 0.88rem;
-}
-caption { caption-side: top; text-align: left; }
-th, td {
-  border: 1px solid var(--border);
-  padding: 0.45rem 0.65rem;
-  text-align: left;
-  vertical-align: top;
-}
-th {
-  background: var(--bg-alt);
-  font-weight: 600;
-  position: sticky;
-  top: 0;
-}
-tbody tr:nth-child(even) { background: #fbfcfd; }
-.num { text-align: right; font-variant-numeric: tabular-nums; }
-.pass { color: var(--pass); font-weight: 600; }
-.fail { color: var(--fail); font-weight: 600; }
-.reason { color: var(--muted); font-size: 0.82rem; max-width: 32rem; }
-.bar-cell { display: flex; align-items: center; gap: 0.5rem; }
-.bar-track { flex: 1; background: var(--bg-alt); border-radius: 3px; height: 8px; min-width: 60px; }
-.bar-fill { background: var(--pass); border-radius: 3px; height: 8px; }
-.bar-fill.low { background: var(--fail); }
-.summary-table td, .summary-table th { white-space: nowrap; }
-.detail-table td.reason, .detail-table td.input { white-space: normal; }
-.error-cell { color: var(--fail); font-size: 0.82rem; }
-"""
+def overall_pass_rate(rows: list[dict]) -> Optional[float]:
+    """Pass rate across ALL rows, independent of grouping   the single
+    headline number for the report's KPI strip. None if no row has a
+    `success` value at all."""
+    successes = [r.get("success") for r in rows if r.get("success") is not None]
+    return (sum(1 for s in successes if s) / len(successes)) if successes else None
 
 
 def _esc(value) -> str:
@@ -284,11 +217,11 @@ def _esc(value) -> str:
 
 
 def _fmt_score(value: Optional[float]) -> str:
-    return "—" if value is None else f"{value:.2f}"
+    return " " if value is None else f"{value:.2f}"
 
 
 def _fmt_pct(value: Optional[float]) -> str:
-    return "—" if value is None else f"{value * 100:.0f}%"
+    return " " if value is None else f"{value * 100:.0f}%"
 
 
 def _fmt_cost(value: Optional[float]) -> str:
@@ -297,7 +230,7 @@ def _fmt_cost(value: Optional[float]) -> str:
     isn't a large batch. Uses more precision for small-but-nonzero values,
     2 decimals once the amount is large enough for that to be meaningful."""
     if value is None:
-        return "—"
+        return " "
     if value == 0:
         return "$0.00"
     if abs(value) < 0.01:
@@ -306,14 +239,14 @@ def _fmt_cost(value: Optional[float]) -> str:
 
 
 def _fmt_tokens(value: Optional[int]) -> str:
-    """Thousands-separated integer, "—" if None (unknown/unavailable —
+    """Thousands-separated integer, " " if None (unknown/unavailable  
     see total_tokens()'s docstring), never "0" standing in for unknown."""
-    return "—" if value is None else f"{value:,}"
+    return " " if value is None else f"{value:,}"
 
 
 def _score_bar(value: Optional[float], threshold: Optional[float]) -> str:
     if value is None:
-        return "—"
+        return " "
     pct = max(0.0, min(1.0, value))
     low = threshold is not None and value < threshold
     return (
@@ -321,6 +254,36 @@ def _score_bar(value: Optional[float], threshold: Optional[float]) -> str:
         f'<div class="bar-track"><div class="bar-fill{" low" if low else ""}" '
         f'style="width:{pct * 100:.0f}%"></div></div></div>'
     )
+
+
+def _pass_badge(success: Optional[bool]) -> str:
+    if success is True:
+        return '<span class="badge pass">● pass</span>'
+    if success is False:
+        return '<span class="badge fail">● fail</span>'
+    return " "
+
+
+def _brand_header(eyebrow: str, title_html: str, pills: list[str]) -> str:
+    """Shared header block for every report type: the italic wordmark +
+    pink dot (echoes the site's brand mark), an eyebrow label, the report
+    title, and a row of meta pills (source file, row count, cost, ...)."""
+    pills_html = "".join(pills)
+    return f"""<div class="report-header">
+  <div class="report-titleblock">
+    <div class="brand"><span class="dot"></span>elyaeval</div>
+    <h1>{title_html}</h1>
+  </div>
+  <div class="meta-pills">{pills_html}</div>
+</div>"""
+
+
+def _kpi_card(tag: str, color: str, value: str, caption: str) -> str:
+    return f"""<div class="kpi-card {color}">
+  <span class="kpi-tag"><span class="dot"></span>{_esc(tag)}</span>
+  <div class="kpi-value">{value}</div>
+  <div class="kpi-caption">{_esc(caption)}</div>
+</div>"""
 
 
 def _summary_table(rows: list[dict], group_keys: tuple[str, ...]) -> str:
@@ -357,7 +320,7 @@ def _summary_table(rows: list[dict], group_keys: tuple[str, ...]) -> str:
             f'<td class="num">{_fmt_pct(s["pass_rate"])} '
             f'<span class="reason">({s["pass_count"]}/{s["pass_total"]})</span></td>'
             f'<td class="num">{_fmt_score(s["threshold"])}</td>'
-            f'<td>{_esc(s["evaluation_model"] or "—")}</td>'
+            f'<td>{_esc(s["evaluation_model"] or " ")}</td>'
             f'<td class="num">{_fmt_cost(s["total_cost"])}'
             f'<span class="reason">{cost_note}</span></td>'
             f'<td class="num">{_fmt_tokens(s["total_input_tokens"])}'
@@ -367,10 +330,10 @@ def _summary_table(rows: list[dict], group_keys: tuple[str, ...]) -> str:
         )
 
     return (
-        '<table class="summary-table">'
+        '<div class="table-wrap"><table class="summary-table">'
         f"<thead><tr>{head_html}</tr></thead>"
         f"<tbody>{''.join(body_rows)}</tbody>"
-        "</table>"
+        "</table></div>"
     )
 
 
@@ -396,12 +359,6 @@ def _detail_table(rows: list[dict], extra_columns: tuple[str, ...] = ()) -> str:
         cells = "".join(f"<td>{_esc(r.get(c, ''))}</td>" for c in base_cols[:-2])
         input_val = _esc(r.get("input", ""))
         metric_val = _esc(r.get("metric_name", ""))
-        success = r.get("success")
-        result_html = (
-            '<span class="pass">pass</span>' if success is True
-            else '<span class="fail">fail</span>' if success is False
-            else "—"
-        )
         reason = r.get("error") or r.get("reason") or ""
         reason_class = "error-cell" if r.get("error") else "reason"
         body_rows.append(
@@ -411,8 +368,8 @@ def _detail_table(rows: list[dict], extra_columns: tuple[str, ...] = ()) -> str:
             f"<td>{metric_val}</td>"
             f'<td class="num">{_fmt_score(r.get("score"))}</td>'
             f'<td class="num">{_fmt_score(r.get("threshold"))}</td>'
-            f"<td>{result_html}</td>"
-            f'<td>{_esc(r.get("evaluation_model") or "—")}</td>'
+            f"<td>{_pass_badge(r.get('success'))}</td>"
+            f'<td>{_esc(r.get("evaluation_model") or " ")}</td>'
             f'<td class="num">{_fmt_cost(r.get("evaluation_cost"))}</td>'
             f'<td class="num">{_fmt_tokens(r.get("input_tokens"))}</td>'
             f'<td class="num">{_fmt_tokens(r.get("output_tokens"))}</td>'
@@ -421,10 +378,10 @@ def _detail_table(rows: list[dict], extra_columns: tuple[str, ...] = ()) -> str:
         )
 
     return (
-        '<table class="detail-table">'
+        '<div class="table-wrap"><table class="detail-table">'
         f"<thead><tr>{head_html}</tr></thead>"
         f"<tbody>{''.join(body_rows)}</tbody>"
-        "</table>"
+        "</table></div>"
     )
 
 
@@ -436,14 +393,16 @@ def render_html_report(
 ) -> Path:
     """
     Build a single self-contained HTML file (inline CSS, no external
-    assets/CDN calls — safe to open straight from a blob-storage download
+    assets/CDN calls   safe to open straight from a blob-storage download
     with no server behind it) next to `csv_path`, showing:
 
-      1. a per-metric (or per-`group_keys`) summary table: average score,
+      1. a KPI strip: goldens tested, overall pass rate, total judge cost,
+         total tokens   the four numbers someone checking CI wants first;
+      2. a per-metric (or per-`group_keys`) summary table: average score,
          min/max, pass rate, and the threshold, computed once across every
          golden that ran in this suite;
-      2. the full per-golden/per-metric detail table the CSV already has,
-         with pass/fail colored and a score bar per row.
+      3. the full per-golden/per-metric detail table the CSV already has,
+         with pass/fail badges and a score bar per row.
 
     `html_path` defaults to the same filename as `csv_path` with a .html
     extension, so an uploaded CSV and its HTML sibling are always easy to
@@ -460,6 +419,35 @@ def render_html_report(
     report_title = title or csv_path.stem
     run_cost = total_cost(rows)
     run_input_tokens, run_output_tokens = total_tokens(rows)
+    run_pass_rate = overall_pass_rate(rows)
+    n_goldens = len({r.get("golden_id") for r in rows if r.get("golden_id")}) or len(rows)
+
+    header = _brand_header(
+        eyebrow="Evaluation report",
+        title_html=_esc(report_title),
+        pills=[
+            f'<span class="pill">Source <strong>{_esc(csv_path.name)}</strong></span>',
+            f'<span class="pill">Rows <strong>{len(rows)}</strong></span>',
+        ],
+    )
+
+    kpi_html = (
+        '<div class="kpi-grid">'
+        + _kpi_card("Goldens", "blue", str(n_goldens), "Tested this run")
+        + _kpi_card(
+            "Pass rate", "cyan",
+            _fmt_pct(run_pass_rate),
+            "Across every scored row",
+        )
+        + _kpi_card("Judge cost", "pink", _fmt_cost(run_cost), "Total for this run")
+        + _kpi_card(
+            "Tokens",
+            "neutral",
+            f"{_fmt_tokens(run_input_tokens)} / {_fmt_tokens(run_output_tokens)}",
+            "Input / output",
+        )
+        + "</div>"
+    )
 
     doc = f"""<!DOCTYPE html>
 <html lang="en">
@@ -467,20 +455,18 @@ def render_html_report(
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>{_esc(report_title)}</title>
-<style>{_CSS}</style>
+<style>{_load_css()}</style>
 </head>
 <body>
-<h1>{_esc(report_title)}</h1>
-<div class="meta">
-  <span>Source: {_esc(csv_path.name)}</span>
-  <span>Rows: {len(rows)}</span>
-  <span>Total judge cost: {_fmt_cost(run_cost)}</span>
-  <span>Total tokens: {_fmt_tokens(run_input_tokens)} in / {_fmt_tokens(run_output_tokens)} out</span>
-</div>
-<h2>Per-metric summary</h2>
+<div class="report-shell">
+{header}
+{kpi_html}
+<h2 class="section-label">Per-metric summary</h2>
 {_summary_table(rows, group_keys)}
-<h2>Per-golden detail</h2>
+<h2 class="section-label pink">Per-golden detail</h2>
 {_detail_table(rows, extra_columns)}
+<div class="report-footer">Generated by elyaeval &middot; {_esc(csv_path.name)}</div>
+</div>
 </body>
 </html>
 """
@@ -497,7 +483,7 @@ def print_metric_averages(
     """Plain-text version of the summary table. `write` defaults to the
     builtin print(); pass a pytest TerminalReporter's write_line (or any
     other str -> None callable) to route it through pytest's own output
-    machinery instead — plugin.py does this so the summary shows up
+    machinery instead   plugin.py does this so the summary shows up
     reliably even under output capturing that a bare print() at
     sessionfinish time could otherwise get swallowed by."""
     summaries = metric_averages(rows, group_keys=group_keys)
@@ -514,7 +500,7 @@ def print_metric_averages(
     write("-" * (label_width + 74))
     for s in summaries:
         label = " / ".join(str(s[k]) for k in group_keys)
-        pass_str = f"{s['pass_count']}/{s['pass_total']}" if s["pass_total"] else "—"
+        pass_str = f"{s['pass_count']}/{s['pass_total']}" if s["pass_total"] else " "
         write(
             f"{label:<{label_width}}  {_fmt_score(s['avg_score']):>6}  "
             f"{_fmt_score(s['min_score']):>6}  {_fmt_score(s['max_score']):>6}  "
@@ -527,7 +513,7 @@ def print_metric_averages(
 
 
 # ---------------------------------------------------------------------------
-# Regression comparison — diffing two runs' metric_averages() against each
+# Regression comparison   diffing two runs' metric_averages() against each
 # other. Works purely off elyaeval's own CSVs, so it needs no Confident AI
 # account.
 # ---------------------------------------------------------------------------
@@ -545,26 +531,15 @@ def compare_runs(
     Align baseline vs candidate metric_averages() by group_keys and compute,
     per group that appears in EITHER run:
 
-      - baseline_avg / candidate_avg / delta (candidate - baseline; None if
-        either side is missing an avg — e.g. a metric that errored out
-        entirely on one side, or a metric only one of the two runs has)
-      - baseline_pass_rate / candidate_pass_rate / pass_rate_delta, same
-        None-if-missing rule
-      - regressed: True if the group exists in BOTH runs and
-        candidate_avg is more than `tolerance` below baseline_avg. A group
-        that's brand new in candidate (not in baseline at all) or that
-        disappeared (was in baseline, not in candidate) is flagged
-        separately via `status`, not silently marked as regressed — a
-        metric that's simply new isn't a regression, and one that's gone
-        deserves its own callout (did the SUT drop a pipeline stage? did
-        the suite change?) rather than being invisible.
-      - status: "regressed" | "improved" | "unchanged" | "new" | "removed"
-        "improved"/"unchanged" split at the same `tolerance` band as
-        regression, so a +0.001 wobble isn't reported as "improved" any
-        more than a -0.001 wobble is reported as "regressed."
+    Each result has baseline_avg/candidate_avg/delta and
+    baseline_pass_rate/candidate_pass_rate/pass_rate_delta (None if a side
+    is missing), plus a status: "regressed"/"improved"/"unchanged" (delta
+    vs. `tolerance`, an absolute 0..1 score difference, default 0.02),
+    "new" (candidate only), or "removed" (baseline only) new/removed
+    metrics are never counted as regressed.
 
     tolerance is an absolute score difference (both scores are 0..1), not a
-    percentage — default 0.02 matches a reasonable "noise floor" for an
+    percentage   default 0.02 matches a reasonable "noise floor" for an
     LLM-judge metric re-run on unchanged inputs, but pass your own if a
     metric's judge is noisier or stricter than that.
     """
@@ -593,10 +568,9 @@ def compare_runs(
         elif b_avg is None or c_avg is None:
             status = "unchanged"  # can't compare numerically; don't guess
         else:
-            # Round before comparing to tolerance — plain float subtraction
+            # Round before comparing to tolerance   plain float subtraction
             # can put a value that's conceptually exactly AT the tolerance
-            # boundary a hair past it (e.g. 0.88 - 0.90 == -0.020000000000000018,
-            # not -0.02), which would otherwise flip an "unchanged" result
+            # boundary a hair past it , which would otherwise flip an "unchanged" result
             # to "regressed" purely from binary floating-point representation
             # error, not a real score difference.
             delta = round(c_avg - b_avg, 9)
@@ -627,7 +601,7 @@ def print_comparison(
     group_keys: tuple[str, ...] = ("metric_name",),
     write=print,
 ) -> None:
-    """Plain-text regression table — what `elyaeval compare` prints."""
+    """Plain-text regression table   what `elyaeval compare` prints."""
     if not comparisons:
         write("No metrics in either run.")
         return
@@ -639,7 +613,7 @@ def print_comparison(
     write("-" * (label_width + 45))
     for c in comparisons:
         label = " / ".join(str(c[k]) for k in group_keys)
-        delta_str = "—" if c["delta"] is None else f"{c['delta']:+.3f}"
+        delta_str = " " if c["delta"] is None else f"{c['delta']:+.3f}"
         marker = {
             "regressed": "▼ REGRESSED",
             "improved": "▲ improved",
@@ -658,6 +632,15 @@ def print_comparison(
         write("\nNo regressions beyond tolerance.")
 
 
+_STATUS_BADGE = {
+    "regressed": '<span class="badge fail">▼ regressed</span>',
+    "improved": '<span class="badge pass">▲ improved</span>',
+    "unchanged": '<span class="badge neutral">= unchanged</span>',
+    "new": '<span class="badge cyan">+ new</span>',
+    "removed": '<span class="badge pink">− removed</span>',
+}
+
+
 def render_comparison_html(
     comparisons: list[dict],
     group_keys: tuple[str, ...] = ("metric_name",),
@@ -665,23 +648,8 @@ def render_comparison_html(
     title: str = "Regression comparison",
 ) -> Optional[Path]:
     """HTML version of print_comparison. Returns None (writes nothing) if
-    no html_path given — pass one explicitly, there's no CSV to infer a
+    no html_path given   pass one explicitly, there's no CSV to infer a
     path from here since this compares two of them."""
-    status_class = {
-        "regressed": "fail",
-        "improved": "pass",
-        "unchanged": "reason",
-        "new": "reason",
-        "removed": "error-cell",
-    }
-    status_label = {
-        "regressed": "▼ regressed",
-        "improved": "▲ improved",
-        "unchanged": "= unchanged",
-        "new": "+ new",
-        "removed": "− removed",
-    }
-
     headers = [k.replace("_", " ").title() for k in group_keys] + [
         "Baseline avg", "Candidate avg", "Delta", "Baseline pass", "Candidate pass", "Status",
     ]
@@ -689,7 +657,7 @@ def render_comparison_html(
     body_rows = []
     for c in comparisons:
         key_cells = "".join(f"<td>{_esc(c[k])}</td>" for k in group_keys)
-        delta_str = "—" if c["delta"] is None else f"{c['delta']:+.3f}"
+        delta_str = " " if c["delta"] is None else f"{c['delta']:+.3f}"
         body_rows.append(
             "<tr>"
             f"{key_cells}"
@@ -698,21 +666,36 @@ def render_comparison_html(
             f'<td class="num">{delta_str}</td>'
             f'<td class="num">{_fmt_pct(c["baseline_pass_rate"])}</td>'
             f'<td class="num">{_fmt_pct(c["candidate_pass_rate"])}</td>'
-            f'<td class="{status_class[c["status"]]}">{status_label[c["status"]]}</td>'
+            f'<td>{_STATUS_BADGE[c["status"]]}</td>'
             "</tr>"
         )
     table_html = (
-        '<table class="detail-table">'
+        '<div class="table-wrap"><table class="detail-table">'
         f"<thead><tr>{head_html}</tr></thead>"
         f"<tbody>{''.join(body_rows)}</tbody>"
-        "</table>"
+        "</table></div>"
     )
 
     n_regressed = sum(1 for c in comparisons if c["status"] == "regressed")
-    verdict = (
-        f'<p style="color:var(--fail); font-weight:600;">{n_regressed} metric(s) regressed beyond tolerance.</p>'
+    n_improved = sum(1 for c in comparisons if c["status"] == "improved")
+
+    header = _brand_header(
+        eyebrow="Regression comparison",
+        title_html=_esc(title),
+        pills=[f'<span class="pill">Metrics compared <strong>{len(comparisons)}</strong></span>'],
+    )
+
+    verdict_kpi = (
+        _kpi_card("Regressed", "pink", str(n_regressed), f"Beyond tolerance ({DEFAULT_REGRESSION_TOLERANCE:g})")
         if n_regressed
-        else '<p style="color:var(--pass); font-weight:600;">No regressions beyond tolerance.</p>'
+        else _kpi_card("Regressed", "cyan", "0", "No regressions beyond tolerance")
+    )
+    kpi_html = (
+        '<div class="kpi-grid">'
+        + verdict_kpi
+        + _kpi_card("Improved", "blue", str(n_improved), "Beyond tolerance")
+        + _kpi_card("Compared", "neutral", str(len(comparisons)), "Metric / group rows")
+        + "</div>"
     )
 
     doc = f"""<!DOCTYPE html>
@@ -721,13 +704,16 @@ def render_comparison_html(
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>{_esc(title)}</title>
-<style>{_CSS}</style>
+<style>{_load_css()}</style>
 </head>
 <body>
-<h1>{_esc(title)}</h1>
-{verdict}
-<h2>Per-metric comparison</h2>
+<div class="report-shell">
+{header}
+{kpi_html}
+<h2 class="section-label blue">Per-metric comparison</h2>
 {table_html}
+<div class="report-footer">Generated by elyaeval</div>
+</div>
 </body>
 </html>
 """
