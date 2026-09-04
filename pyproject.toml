@@ -27,4 +27,4 @@ build-backend = "setuptools.build_meta"
 include = ["elyaeval*"]
 
 [tool.setuptools.package-data]
-elyaeval = ["templates/*.tmpl", "standard_dataset/*.jsonl"]
+elyaeval = ["templates/*.tmpl", "standard_dataset/*.jsonl", "report_theme.css"]
